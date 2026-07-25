@@ -12,3 +12,11 @@ targetConfigs/
 *.opt
 *.cmd.genlibs
 device_linker.cmd
+
+# Other CCS projects (not tracked yet)
+.theia/
+01_LED/
+02_CLOCK_GPIO/
+03_DELAY/
+05_OLED/
+06-UART/
