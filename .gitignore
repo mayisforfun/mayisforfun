@@ -1,0 +1,14 @@
+Debug/
+.settings/
+.vscode/
+.clangd
+.ccsproject
+.cproject
+.project
+targetConfigs/
+*.map
+*.out
+*_linkInfo.xml
+*.opt
+*.cmd.genlibs
+device_linker.cmd
