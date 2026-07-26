@@ -31,6 +31,7 @@ typedef struct {
 void LineFollow_init(LineFollowState *state);
 void LineFollow_update(LineFollowState *state,
                        const LineFollowConfig *config,
-                       uint8_t sensor_bits);
+                       uint8_t sensor_bits,
+                       uint16_t base_speed);
 
 #endif

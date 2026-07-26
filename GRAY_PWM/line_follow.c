@@ -64,7 +64,8 @@ void LineFollow_init(LineFollowState *state)
 
 void LineFollow_update(LineFollowState *state,
                        const LineFollowConfig *config,
-                       uint8_t sensor_bits)
+                       uint8_t sensor_bits,
+                       uint16_t base_speed)
 {
     static const int16_t weights[LINE_SENSOR_COUNT] = {-2000, -1000, 0, 1000, 2000};
     int32_t weighted_sum = 0;
@@ -116,20 +117,20 @@ void LineFollow_update(LineFollowState *state,
                           (int32_t) config->kd_q10 * derivative) / 1024;
     state->last_error = state->error;
 
-    state->left_speed = (int16_t) clamp_u16((int32_t) config->base_speed + correction,
+    state->left_speed = (int16_t) clamp_u16((int32_t) base_speed + correction,
                                             config->max_speed);
-    state->right_speed = (int16_t) clamp_u16((int32_t) config->base_speed - correction,
+    state->right_speed = (int16_t) clamp_u16((int32_t) base_speed - correction,
                                              config->max_speed);
 
     if ((accepted_bits == BIT_SENSOR_L2) || (accepted_bits == (BIT_SENSOR_L2 | BIT_SENSOR_L1))) {
-        state->left_speed = config->base_speed / 3;
+        state->left_speed = base_speed / 3;
         state->right_speed = config->max_speed;
     } else if ((accepted_bits == BIT_SENSOR_R2) || (accepted_bits == (BIT_SENSOR_R2 | BIT_SENSOR_R1))) {
         state->left_speed = config->max_speed;
-        state->right_speed = config->base_speed / 3;
+        state->right_speed = base_speed / 3;
     } else if (accepted_bits == (BIT_SENSOR_L2 | BIT_SENSOR_L1 | BIT_SENSOR_C |
                                  BIT_SENSOR_R1 | BIT_SENSOR_R2)) {
-        state->left_speed = config->base_speed / 2;
-        state->right_speed = config->base_speed / 2;
+        state->left_speed = base_speed / 2;
+        state->right_speed = base_speed / 2;
     }
 }

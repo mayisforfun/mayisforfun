@@ -1,105 +1,108 @@
 #include "board_port.h"
 #include "line_follow.h"
-#include "mpu6050.h"
 
-static const LineFollowConfig g_line_config = {
-    .base_speed = 420,
-    .max_speed = 850,
-    .kp_q10 = 164,
-    .ki_q10 = 8,
-    .kd_q10 = 225,
-    .lost_turn_speed = 320,
+#define MOTOR_DIAGNOSTIC_MODE 1
+#define MOTOR_TEST_SPEED      500
+
+volatile bool     g_ctrl_flag = false;
+volatile uint32_t g_sys_ticks = 0;
+
+volatile uint8_t  g_gray_bits         = 0;
+volatile bool     g_gray_l2           = false;
+volatile bool     g_gray_l1           = false;
+volatile bool     g_gray_c            = false;
+volatile bool     g_gray_r1           = false;
+volatile bool     g_gray_r2           = false;
+volatile bool     g_line_seen         = false;
+volatile bool     g_line_sensor_valid = false;
+volatile int16_t  g_line_position     = 0;
+volatile int16_t  g_line_error        = 0;
+volatile int16_t  g_line_left_speed   = 0;
+volatile int16_t  g_line_right_speed  = 0;
+
+#if !MOTOR_DIAGNOSTIC_MODE
+static LineFollowConfig g_line_config = {
+    .base_speed      = 380,
+    .max_speed       = 750,
+    .kp_q10          = 150,
+    .ki_q10          = 0,
+    .kd_q10          = 220,
+    .lost_turn_speed = 260,
 };
+#endif
 
-volatile bool g_imu_ok = false;
-volatile uint8_t g_mpu6050_who_am_i = 0;
-volatile int16_t g_imu_accel_x = 0;
-volatile int16_t g_imu_accel_y = 0;
-volatile int16_t g_imu_accel_z = 0;
-volatile int16_t g_imu_gyro_x = 0;
-volatile int16_t g_imu_gyro_y = 0;
-volatile int16_t g_imu_gyro_z = 0;
-volatile uint32_t g_imu_read_count = 0;
-volatile uint32_t g_imu_read_fail_count = 0;
-volatile uint8_t g_gray_bits = 0;
-volatile bool g_gray_l2 = false;
-volatile bool g_gray_l1 = false;
-volatile bool g_gray_c = false;
-volatile bool g_gray_r1 = false;
-volatile bool g_gray_r2 = false;
-volatile bool g_line_seen = false;
-volatile bool g_line_sensor_valid = false;
-volatile int16_t g_line_position = 0;
-volatile int16_t g_line_error = 0;
-volatile int16_t g_line_left_speed = 0;
-volatile int16_t g_line_right_speed = 0;
-
-static void update_imu_debug_values(const MPU6050RawData *imu_raw)
+void SysTick_Handler(void)
 {
-    g_imu_accel_x = imu_raw->accel_x;
-    g_imu_accel_y = imu_raw->accel_y;
-    g_imu_accel_z = imu_raw->accel_z;
-    g_imu_gyro_x = imu_raw->gyro_x;
-    g_imu_gyro_y = imu_raw->gyro_y;
-    g_imu_gyro_z = imu_raw->gyro_z;
+    g_ctrl_flag = true;
+    g_sys_ticks++;
 }
 
-static void update_line_debug_values(const LineFollowState *line_state)
+static void update_gray_debug(uint8_t bits)
 {
-    g_gray_bits = line_state->raw_sensor_bits;
-    g_gray_l2 = (line_state->raw_sensor_bits & (1U << 0)) != 0U;
-    g_gray_l1 = (line_state->raw_sensor_bits & (1U << 1)) != 0U;
-    g_gray_c = (line_state->raw_sensor_bits & (1U << 2)) != 0U;
-    g_gray_r1 = (line_state->raw_sensor_bits & (1U << 3)) != 0U;
-    g_gray_r2 = (line_state->raw_sensor_bits & (1U << 4)) != 0U;
-    g_line_seen = line_state->line_seen;
-    g_line_sensor_valid = line_state->sensor_valid;
-    g_line_position = line_state->position;
-    g_line_error = line_state->error;
-    g_line_left_speed = line_state->left_speed;
-    g_line_right_speed = line_state->right_speed;
+    g_gray_bits = bits;
+    g_gray_l2   = (bits & (1U << 0)) != 0U;
+    g_gray_l1   = (bits & (1U << 1)) != 0U;
+    g_gray_c    = (bits & (1U << 2)) != 0U;
+    g_gray_r1   = (bits & (1U << 3)) != 0U;
+    g_gray_r2   = (bits & (1U << 4)) != 0U;
+}
+
+#if !MOTOR_DIAGNOSTIC_MODE
+static void update_line_debug(const LineFollowState *state)
+{
+    update_gray_debug(state->raw_sensor_bits);
+    g_line_seen         = state->line_seen;
+    g_line_sensor_valid = state->sensor_valid;
+    g_line_position     = state->position;
+    g_line_error        = state->error;
+    g_line_left_speed   = state->left_speed;
+    g_line_right_speed  = state->right_speed;
+}
+#endif
+
+static void run_motor_diagnostic(void)
+{
+    while (1) {
+        update_gray_debug(Board_readGray5());
+        Board_setMotorSpeed(MOTOR_TEST_SPEED, MOTOR_TEST_SPEED);
+        Board_delayMs(1200);
+
+        update_gray_debug(Board_readGray5());
+        Board_setMotorSpeed(0, 0);
+        Board_delayMs(800);
+
+        update_gray_debug(Board_readGray5());
+        Board_setMotorSpeed(-MOTOR_TEST_SPEED, -MOTOR_TEST_SPEED);
+        Board_delayMs(1200);
+
+        update_gray_debug(Board_readGray5());
+        Board_setMotorSpeed(0, 0);
+        Board_delayMs(800);
+    }
 }
 
 int main(void)
 {
-    LineFollowState line_state;
-    MPU6050RawData imu_raw;
-    bool imu_ok;
-    uint8_t who_am_i = 0;
-    uint8_t imu_sample_divider = 0;
-
     Board_init();
+
+#if MOTOR_DIAGNOSTIC_MODE
+    run_motor_diagnostic();
+#else
+    LineFollowState line_state;
     LineFollow_init(&line_state);
-    (void) MPU6050_readWhoAmI(&who_am_i);
-    g_mpu6050_who_am_i = who_am_i;
-    imu_ok = MPU6050_init();
-    g_imu_ok = imu_ok;
-    if (!imu_ok) {
-        Board_setBuzzer(true);
-    }
 
     while (1) {
-        uint8_t sensor_bits = Board_readGray5();
-
-        if (imu_ok) {
-            imu_sample_divider++;
-            if (imu_sample_divider >= 10U) {
-                imu_sample_divider = 0;
-                imu_ok = MPU6050_readRaw(&imu_raw);
-                g_imu_ok = imu_ok;
-                if (imu_ok) {
-                    update_imu_debug_values(&imu_raw);
-                    g_imu_read_count++;
-                } else {
-                    g_imu_read_fail_count++;
-                }
-            }
+        __WFI();
+        if (!g_ctrl_flag) {
+            continue;
         }
+        g_ctrl_flag = false;
 
-        LineFollow_update(&line_state, &g_line_config, sensor_bits);
-        update_line_debug_values(&line_state);
+        uint8_t sensor_bits = Board_readGray5();
+        LineFollow_update(&line_state, &g_line_config,
+                          sensor_bits, g_line_config.base_speed);
+        update_line_debug(&line_state);
         Board_setMotorSpeed(line_state.left_speed, line_state.right_speed);
-
-        Board_delayMs(1);
     }
+#endif
 }

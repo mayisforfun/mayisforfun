@@ -84,6 +84,14 @@ void Board_init(void)
     if (LEFT_PWM_INST != RIGHT_PWM_INST) {
         DL_TimerG_startCounter(RIGHT_PWM_INST);
     }
+
+    /* SysTick 100 Hz for fixed-interval control loop */
+    SysTick->LOAD  = (CPUCLK_FREQ / 100U) - 1U;
+    SysTick->VAL   = 0U;
+    SysTick->CTRL  = SysTick_CTRL_CLKSOURCE_Msk |
+                     SysTick_CTRL_TICKINT_Msk |
+                     SysTick_CTRL_ENABLE_Msk;
+    NVIC_EnableIRQ(SysTick_IRQn);
 }
 
 static uint8_t read_gray5_once(void)

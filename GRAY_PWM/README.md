@@ -1,179 +1,160 @@
-# MSPM0G3507 五路灰度循迹示例
+# MSPM0G3507 五路灰度循迹小车
 
-适用目标：CCS Theia / Code Composer Studio，TI MSPM0G3507，天狼星开发板系列，五路数字灰度模块，TB6612 小车差速驱动。
+本工程面向电赛小车快速验证：MSPM0G3507 + 五路数字灰度 + TB6612 差速驱动，可扩展 MPU6050、编码器测速和赛道状态机。
 
-## 文件
+## 当前状态
 
-- `main.c`：1 ms 循环读取灰度、计算循迹、输出电机速度。
-- `line_follow.c/.h`：五路灰度识别和 PD 循迹算法。
-- `board_port.c/.h`：MSPM0 GPIO、PWM、电机方向接口。
-- `mpu6050.c/.h`：MPU6050 初始化、原始数据读取和默认量程换算。
+- `main.c` 默认打开 `MOTOR_DIAGNOSTIC_MODE = 1`，上电后只做电机正反转诊断，不会循迹。
+- 要进入循迹模式，把 `main.c` 顶部改为 `#define MOTOR_DIAGNOSTIC_MODE 0`，再重新编译下载。
+- 控制周期由 `Board_init()` 中 SysTick 设置，当前为 100 Hz，即 10 ms 一次，不是 1 ms。
+- 主循环当前只调用 `LineFollow_update()` 和 `Board_setMotorSpeed()`；`encoder.c`、`speed_control.c`、`track_fsm.c` 已提供扩展模块，但尚未接入默认主循环。
 
-## SysConfig 需要建立的外设
+## 文件分工
+
+| 文件 | 作用 | 比赛调试关注点 |
+|---|---|---|
+| `main.c` | 诊断模式 / 循迹主循环入口 | 先用诊断模式确认电机方向，再关闭诊断模式跑线 |
+| `board_port.c/.h` | GPIO、PWM、电机方向、灰度读取 | 引脚名、PWM 计数周期、黑线电平极性 |
+| `line_follow.c/.h` | 五路灰度位置估计和 PID/PD 修正 | `kp_q10`、`kd_q10`、`base_speed`、`lost_turn_speed` |
+| `encoder.c/.h` | 编码器 1 倍频计数框架 | 需要在主循环中显式接入才生效 |
+| `speed_control.c/.h` | 速度 PID 框架 | `SPEED_TICKS_PER_1000` 必须实测 |
+| `track_fsm.c/.h` | 直道、弯道、十字、丢线状态机 | 当前未接入 `main.c` |
+| `mpu6050.c/.h` | MPU6050 I2C 读取 | 当前未参与循迹控制 |
+| `TIANMENG_IO_MAPPING.md` | 天猛星/天狼星板 IO 对照 | 接线和 SysConfig 命名依据 |
+
+## 必配 SysConfig 外设
 
 ### 1. 五路灰度 GPIO 输入
 
-建立 5 个 GPIO 输入：
+建立 5 个 GPIO 输入，建议名称如下：
 
-- `L2`：最左，A26
-- `L1`：左中，A27
-- `C`：中间，A24
-- `R1`：右中，A25
-- `R2`：最右，B24
+| 位置 | MSPM0 引脚 | 建议名称 |
+|---|---:|---|
+| L2 最左 | A26 | `GRAY_L2` |
+| L1 左中 | A27 | `GRAY_L1` |
+| C 中间 | A24 | `GRAY_C` |
+| R1 右中 | A25 | `GRAY_R1` |
+| R2 最右 | B24 | `GRAY_R2` |
 
-代码已经在 `board_port.h` 里按 `D:\qq\IO口对应.xlsx` 写好了默认引脚。SysConfig 的作用是把这些实际芯片引脚初始化成 GPIO 输入。
-
-若你的灰度模块检测到黑线时输出高电平，把 `board_port.h` 中的：
+代码默认认为灰度模块检测到黑线时输出低电平：
 
 ```c
 #define GRAY_BLACK_IS_LOW 1
 ```
 
-改成：
+如果你的模块黑线输出高电平，改为：
 
 ```c
 #define GRAY_BLACK_IS_LOW 0
 ```
 
-### 2. TB6612 电机方向 GPIO 输出
+### 2. TB6612 方向 GPIO 输出
 
-建立 4 个 GPIO 输出：
+| TB6612 | MSPM0 引脚 | 建议名称 |
+|---|---:|---|
+| AIN1 | B23 | `MOTOR_AIN1` |
+| AIN2 | B26 | `MOTOR_AIN2` |
+| BIN1 | B08 | `MOTOR_BIN1` |
+| BIN2 | B09 | `MOTOR_BIN2` |
+| STBY | 3.3 V 或 GPIO | 若接 GPIO，建议命名 `MOTOR_STBY` |
 
-- `AIN1`：B23
-- `AIN2`：B26
-- `BIN1`：B08
-- `BIN2`：B09
-- `STBY`：表格里未看到明确分配，可以直接接 3.3 V
-
-建议接法：
-
-```text
-TB6612 AIN1 -> B23
-TB6612 AIN2 -> B26
-TB6612 BIN1 -> B08
-TB6612 BIN2 -> B09
-TB6612 STBY -> 3.3 V，或另接一个 GPIO 输出高电平
-```
-
-默认代码把 A 通道当左电机，把 B 通道当右电机。如果实际前进方向反了，交换对应电机的 `AIN1/AIN2` 或 `BIN1/BIN2`，也可以改 `board_port.c` 里的 `set_left_direction()` / `set_right_direction()`。
+默认约定：A 通道为左电机，B 通道为右电机。若小车前进方向反了，优先调换对应电机的 `AIN1/AIN2` 或 `BIN1/BIN2`；若左右电机接反，可交换电机接线或在 `Board_setMotorSpeed()` 中交换 left/right。
 
 ### 3. 两路 PWM
 
-TB6612 的 `PWMA` 控制 A 通道速度，`PWMB` 控制 B 通道速度。给左右电机各配置一路 PWM，PWM 周期建议 1000 计数，对应代码里的：
+推荐使用同一个 Timer 的两个通道：
+
+| TB6612 | MSPM0 引脚 | Timer 通道 | 代码默认 |
+|---|---:|---|---|
+| PWMA | A12 | `TIMG0_C0` | `LEFT_PWM_INST = PWM_0_INST`, `LEFT_PWM_CC_INDEX = DL_TIMER_CC_0_INDEX` |
+| PWMB | A13 | `TIMG0_C1` | `RIGHT_PWM_INST = PWM_0_INST`, `RIGHT_PWM_CC_INDEX = DL_TIMER_CC_1_INDEX` |
+
+PWM 周期要与代码一致：
 
 ```c
 #define MOTOR_PWM_PERIOD_COUNTS 1000U
 ```
 
-如果 SysConfig 里的 Timer PWM 周期不是 1000，需要把
-`MOTOR_PWM_PERIOD_COUNTS` 改成实际 load/period 计数；否则
-`base_speed`、`max_speed` 和占空比比例都会不准。
+如果 SysConfig 的 Timer period/load 不是 1000，必须同步修改该宏，否则 `base_speed`、`max_speed` 和占空比比例都会失真。
 
-代码默认使用反向 compare 写法：
+当前代码默认使用反向 compare：
 
 ```c
 #define MOTOR_PWM_COMPARE_IS_INVERTED 1
 ```
 
-也就是 `compare = period - duty`。如果你在 SysConfig 中配置的是普通正向
-PWM，表现为速度越大占空比越小，或速度为 0 时电机反而满速，就把它改成：
-
-```c
-#define MOTOR_PWM_COMPARE_IS_INVERTED 0
-```
-
-然后在 `board_port.c` 顶部把以下宏改成你 SysConfig 生成的名字：
-
-```c
-#define LEFT_PWM_INST PWM_0_INST
-#define LEFT_PWM_CC_INDEX DL_TIMER_CC_0_INDEX
-#define RIGHT_PWM_INST PWM_1_INST
-#define RIGHT_PWM_CC_INDEX DL_TIMER_CC_0_INDEX
-```
-
-建议接法：
-
-```text
-TB6612 PWMA -> MSPM0 左电机 PWM
-TB6612 PWMB -> MSPM0 右电机 PWM
-```
-
-如果你用同一个 Timer 的两个 PWM 通道，`LEFT_PWM_INST` 和 `RIGHT_PWM_INST` 可以相同，但 `CC_INDEX` 应该不同。
+即 `compare = period - duty`。若实际现象是速度越大占空比越小，或速度为 0 时电机满速，把它改成 `0`。
 
 ## 灰度位定义
 
-`Board_readGray5()` 返回 5 bit：
+`Board_readGray5()` 返回 5 bit，黑线识别到时对应 bit 为 1：
 
 ```text
 传感器：L2  L1  C   R1  R2
 bit：   0   1   2   3   4
+权重： -2000 -1000 0 1000 2000
 ```
 
-黑线被识别到时对应 bit 为 1。例如：
+典型状态：
 
-- 只有 `C` 为 1：中间压线，直行。
-- `L1 + C` 或 `L2 + L1` 为 1：线偏左，小车左修正。
-- `C + R1` 或 `R1 + R2` 为 1：线偏右，小车右修正。
-- 五路全为 0：丢线，按上一次误差原地找线。
+- `C`：车在中线，直行。
+- `L1 + C` 或 `L2 + L1`：线在左侧，应左修正。
+- `C + R1` 或 `R1 + R2`：线在右侧，应右修正。
+- `0x00`：丢线，按上一次误差原地找线。
+- `0x1F`：全黑，代码按十字/交叉线低速通过。
+- 非连续组合，例如 `L2 + R2`：默认判为异常，沿用上一帧有效灰度状态。
 
-## MPU6050 / 陀螺仪 I2C
+## 调车流程
 
-按 `D:\qq\IO口对应.xlsx`，陀螺仪接口是：
-
-```text
-T_SCL -> A17 -> I2C1_SCL
-T_SDA -> A16 -> I2C1_SDA
-INT   -> A14 -> GPIO 输入，可先不接入代码
-```
-
-SysConfig 中添加一个 I2C Controller，SCL 选 A17，SDA 选 A16，速率建议先用
-100 kHz。若你把 SysConfig 里的 I2C 模块命名为 `I2C_0`，代码默认会使用
-`I2C_0_INST`；如果生成的实例名不同，在 `mpu6050.c` 顶部覆盖：
+1. 架空车轮，保持 `MOTOR_DIAGNOSTIC_MODE = 1`，确认左右轮都能正转、停止、反转。
+2. 若某一侧方向反，先调电机方向引脚或电机线，不要急着改 PID。
+3. 用串口/调试变量观察 `g_gray_bits`，确认五路灰度从左到右对应 bit 0 到 bit 4。
+4. 关闭诊断模式：`#define MOTOR_DIAGNOSTIC_MODE 0`。
+5. 低速起跑，建议初值：
 
 ```c
-#define MPU6050_I2C_INST 你的_I2C_实例名
+.base_speed = 300,
+.max_speed = 650,
+.kp_q10 = 120,
+.ki_q10 = 0,
+.kd_q10 = 180,
+.lost_turn_speed = 220,
 ```
 
-MPU6050 默认地址是 `0x68`。如果模块 AD0 接高电平，改成：
+6. 直线摆动大：降低 `kp_q10` 或提高 `kd_q10`。
+7. 弯道跟不上：提高 `kp_q10` 或降低 `base_speed`。
+8. 丢线找线太猛：降低 `lost_turn_speed`。
+9. 车速提高后再逐步增加 `base_speed` 和 `max_speed`，每次只改一个参数。
 
-```c
-#define MPU6050_I2C_ADDRESS MPU6050_I2C_ADDR_AD0_HIGH
-```
+`kp_q10`、`ki_q10`、`kd_q10` 是 Q10 定点数，实际系数 = 参数 / 1024。例如 `150 / 1024 = 0.146`。
 
-## 调参顺序
+## 编码器和速度闭环
 
-1. 先把车架垫起来，确认左右电机方向和 PWM 占空比正常。
-2. 慢速测试：`base_speed = 300`，`max_speed = 650`。
-3. 如果车左右摆动大，降低 `kp_q10` 或升高 `kd_q10`。
-4. 如果车转弯跟不上，提高 `kp_q10` 或降低 `base_speed`。
-5. 如果丢线后原地找线太猛，降低 `lost_turn_speed`。
+编码器引脚已在 `encoder.c` 中给出：
 
-当前默认参数在 `main.c`：
+| 信号 | MSPM0 引脚 |
+|---|---:|
+| 左 A | A00 |
+| 左 B | A01 |
+| 右 A | B04 |
+| 右 B | B05 |
 
-```c
-.base_speed = 420,
-.max_speed = 850,
-.kp_q10 = 164,
-.kd_q10 = 225,
-.lost_turn_speed = 320,
-```
+当前 `main.c` 没有调用 `Encoder_init()`、`Encoder_getLeftTicks()`、`Encoder_getRightTicks()` 或 `SpeedPID_compute()`。如果要做速度闭环，需要先把编码器初始化和速度 PID 接入 10 ms 控制循环，并实测 `SPEED_TICKS_PER_1000`。
 
-`kp_q10` 和 `kd_q10` 是 Q10 定点数，实际系数 = 参数 / 1024。例如 `164 / 1024 = 0.160`。
+## MPU6050
 
-当前 `Board_readGray5()` 默认对灰度输入做 3 次多数表决：
+| 信号 | MSPM0 引脚 | 功能 |
+|---|---:|---|
+| T_SCL | A17 | `I2C1_SCL` |
+| T_SDA | A16 | `I2C1_SDA` |
+| INT | A14 | GPIO 输入，可先不接 |
 
-```c
-#define GRAY_SAMPLE_COUNT 3U
-#define GRAY_SAMPLE_INTERVAL_CYCLES 0U
-```
+SysConfig 中添加 I2C Controller，SCL 选 A17，SDA 选 A16，建议先用 100 kHz。默认地址为 `0x68`；若 AD0 接高电平，改用 `MPU6050_I2C_ADDR_AD0_HIGH`。
 
-如果传感器抖动明显，可以把 `GRAY_SAMPLE_INTERVAL_CYCLES` 调大一点；如果车速较快、
-弯道响应变慢，可以把采样次数改回 `1U`。
+## 常见问题
 
-## 接入 CCS 工程
-
-1. 新建 MSPM0G3507 空工程或基于 TI empty 示例工程。
-2. 用 SysConfig 配好 `GRAY`、`MOTOR`、左右 PWM。
-3. 把本目录下 `.c` 和 `.h` 文件加入工程。
-4. 若工程已有 `main.c`，用这里的 `main.c` 逻辑替换主循环即可。
-5. 编译时报某个宏未定义时，优先检查 SysConfig 里外设和引脚名称是否与本文一致。
+- 编译报 `PWM_0_INST` 未定义：SysConfig 生成的 PWM 实例名不同，改 `board_port.c` 顶部 `LEFT_PWM_INST` / `RIGHT_PWM_INST`。
+- 下载后不循迹：检查 `MOTOR_DIAGNOSTIC_MODE` 是否仍为 `1`。
+- 灰度全反：检查 `GRAY_BLACK_IS_LOW`。
+- 电机速度数值改了无效：核对 Timer period/load 是否等于 `MOTOR_PWM_PERIOD_COUNTS`。
+- 车一放地就冲出去：先把 `base_speed` 降到 250 到 300，确认方向和灰度 bit 后再加速。
