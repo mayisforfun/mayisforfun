@@ -6,14 +6,15 @@
 #include "ti_msp_dl_config.h"
 
 /*
- * Default pin mapping from D:\qq\IO口对应.xlsx:
+ * Pin mapping from D:\qq\IO�ڶ�Ӧ.xlsx.
+ * Gray input order is corrected in board_port.c for the actual car wiring.
  *
- * Gray:
- *   OUT1/L2 -> PA26
- *   OUT2/L1 -> PA27
- *   OUT3/C  -> PA24
- *   OUT4/R1 -> PA25
- *   OUT5/R2 -> PB24
+ * Gray physical pins:
+ *   OUT1 -> PA26
+ *   OUT2 -> PA27
+ *   OUT3 -> PA24
+ *   OUT4 -> PA25
+ *   OUT5 -> PB24
  *
  * TB6612:
  *   AIN1 -> PB23
@@ -23,12 +24,10 @@
  *   PWMA -> PA12 / TIMG0_C0
  *   PWMB -> PA13 / TIMG0_C1
  *   BEEP -> PB25
- *
- * SysConfig still needs to initialize these pins as GPIO input/output/PWM.
  */
 
 #ifndef GRAY_BLACK_IS_LOW
-#define GRAY_BLACK_IS_LOW 1
+#define GRAY_BLACK_IS_LOW 0
 #endif
 
 #ifndef GRAY_SAMPLE_COUNT
@@ -146,6 +145,19 @@
 #endif
 #endif
 
+
+#ifndef START_BUTTON_PORT
+#define START_BUTTON_PORT GPIOA
+#endif
+#ifndef START_BUTTON_PIN
+#define START_BUTTON_PIN DL_GPIO_PIN_7
+#endif
+#ifndef START_BUTTON_IOMUX
+#define START_BUTTON_IOMUX IOMUX_PINCM14
+#endif
+#ifndef START_BUTTON_ACTIVE_LOW
+#define START_BUTTON_ACTIVE_LOW 1
+#endif
 #ifndef BEEP_PORT
 #define BEEP_PORT GPIOB
 #endif
@@ -160,6 +172,7 @@
 void Board_init(void);
 uint8_t Board_readGray5(void);
 void Board_setMotorSpeed(int16_t left_speed, int16_t right_speed);
+bool Board_readStartButton(void);
 void Board_setBuzzer(bool on);
 void Board_delayMs(uint32_t ms);
 

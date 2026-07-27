@@ -101,7 +101,13 @@ void LineFollow_update(LineFollowState *state,
 
     int16_t derivative = state->error - state->last_error;
 
-    /* 积分累加 + 抗饱和: 只在输出未饱和时累计 */
+    if (derivative > 1000) {
+        derivative = 1000;
+    } else if (derivative < -1000) {
+        derivative = -1000;
+    }
+
+    /* 积分累加 + 抗饱�? 只在输出未饱和时累计 */
     state->integral += state->error;
     {
         int32_t max_integral = ((int32_t) config->max_speed * 1024) / 2;
@@ -122,12 +128,15 @@ void LineFollow_update(LineFollowState *state,
     state->right_speed = (int16_t) clamp_u16((int32_t) base_speed - correction,
                                              config->max_speed);
 
+    uint16_t outer_slow_speed = base_speed / 2U;
+    uint16_t outer_fast_speed = (uint16_t) ((base_speed + config->max_speed) / 2U);
+
     if ((accepted_bits == BIT_SENSOR_L2) || (accepted_bits == (BIT_SENSOR_L2 | BIT_SENSOR_L1))) {
-        state->left_speed = base_speed / 3;
-        state->right_speed = config->max_speed;
+        state->left_speed = outer_slow_speed;
+        state->right_speed = outer_fast_speed;
     } else if ((accepted_bits == BIT_SENSOR_R2) || (accepted_bits == (BIT_SENSOR_R2 | BIT_SENSOR_R1))) {
-        state->left_speed = config->max_speed;
-        state->right_speed = base_speed / 3;
+        state->left_speed = outer_fast_speed;
+        state->right_speed = outer_slow_speed;
     } else if (accepted_bits == (BIT_SENSOR_L2 | BIT_SENSOR_L1 | BIT_SENSOR_C |
                                  BIT_SENSOR_R1 | BIT_SENSOR_R2)) {
         state->left_speed = base_speed / 2;

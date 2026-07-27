@@ -72,9 +72,17 @@ static void set_right_direction(bool forward)
     }
 }
 
+
+static void init_start_button(void)
+{
+    DL_GPIO_initDigitalInputFeatures(START_BUTTON_IOMUX,
+        DL_GPIO_INVERSION_DISABLE, DL_GPIO_RESISTOR_PULL_UP,
+        DL_GPIO_HYSTERESIS_DISABLE, DL_GPIO_WAKEUP_DISABLE);
+}
 void Board_init(void)
 {
     SYSCFG_DL_init();
+    init_start_button();
 
 #ifdef MOTOR_STBY_PIN
     DL_GPIO_setPins(MOTOR_STBY_PORT, MOTOR_STBY_PIN);
@@ -99,17 +107,17 @@ static uint8_t read_gray5_once(void)
     uint8_t bits = 0;
 
 #if GRAY_BLACK_IS_LOW
-    if ((DL_GPIO_readPins(GRAY_L2_PORT, GRAY_L2_PIN) & GRAY_L2_PIN) == 0U) { bits |= BIT_SENSOR_L2; }
-    if ((DL_GPIO_readPins(GRAY_L1_PORT, GRAY_L1_PIN) & GRAY_L1_PIN) == 0U) { bits |= BIT_SENSOR_L1; }
+    if ((DL_GPIO_readPins(GRAY_L2_PORT, GRAY_L2_PIN) & GRAY_L2_PIN) == 0U) { bits |= BIT_SENSOR_R2; }
+    if ((DL_GPIO_readPins(GRAY_L1_PORT, GRAY_L1_PIN) & GRAY_L1_PIN) == 0U) { bits |= BIT_SENSOR_R1; }
     if ((DL_GPIO_readPins(GRAY_C_PORT, GRAY_C_PIN) & GRAY_C_PIN) == 0U) { bits |= BIT_SENSOR_C; }
-    if ((DL_GPIO_readPins(GRAY_R1_PORT, GRAY_R1_PIN) & GRAY_R1_PIN) == 0U) { bits |= BIT_SENSOR_R1; }
-    if ((DL_GPIO_readPins(GRAY_R2_PORT, GRAY_R2_PIN) & GRAY_R2_PIN) == 0U) { bits |= BIT_SENSOR_R2; }
+    if ((DL_GPIO_readPins(GRAY_R1_PORT, GRAY_R1_PIN) & GRAY_R1_PIN) == 0U) { bits |= BIT_SENSOR_L1; }
+    if ((DL_GPIO_readPins(GRAY_R2_PORT, GRAY_R2_PIN) & GRAY_R2_PIN) == 0U) { bits |= BIT_SENSOR_L2; }
 #else
-    if ((DL_GPIO_readPins(GRAY_L2_PORT, GRAY_L2_PIN) & GRAY_L2_PIN) != 0U) { bits |= BIT_SENSOR_L2; }
-    if ((DL_GPIO_readPins(GRAY_L1_PORT, GRAY_L1_PIN) & GRAY_L1_PIN) != 0U) { bits |= BIT_SENSOR_L1; }
+    if ((DL_GPIO_readPins(GRAY_L2_PORT, GRAY_L2_PIN) & GRAY_L2_PIN) != 0U) { bits |= BIT_SENSOR_R2; }
+    if ((DL_GPIO_readPins(GRAY_L1_PORT, GRAY_L1_PIN) & GRAY_L1_PIN) != 0U) { bits |= BIT_SENSOR_R1; }
     if ((DL_GPIO_readPins(GRAY_C_PORT, GRAY_C_PIN) & GRAY_C_PIN) != 0U) { bits |= BIT_SENSOR_C; }
-    if ((DL_GPIO_readPins(GRAY_R1_PORT, GRAY_R1_PIN) & GRAY_R1_PIN) != 0U) { bits |= BIT_SENSOR_R1; }
-    if ((DL_GPIO_readPins(GRAY_R2_PORT, GRAY_R2_PIN) & GRAY_R2_PIN) != 0U) { bits |= BIT_SENSOR_R2; }
+    if ((DL_GPIO_readPins(GRAY_R1_PORT, GRAY_R1_PIN) & GRAY_R1_PIN) != 0U) { bits |= BIT_SENSOR_L1; }
+    if ((DL_GPIO_readPins(GRAY_R2_PORT, GRAY_R2_PIN) & GRAY_R2_PIN) != 0U) { bits |= BIT_SENSOR_L2; }
 #endif
 
     return bits;
@@ -172,6 +180,18 @@ void Board_setMotorSpeed(int16_t left_speed, int16_t right_speed)
     set_pwm_duty(RIGHT_PWM_INST, RIGHT_PWM_CC_INDEX, right_duty);
 }
 
+
+bool Board_readStartButton(void)
+{
+    bool level_high = (DL_GPIO_readPins(START_BUTTON_PORT, START_BUTTON_PIN) &
+                       START_BUTTON_PIN) != 0U;
+
+#if START_BUTTON_ACTIVE_LOW
+    return !level_high;
+#else
+    return level_high;
+#endif
+}
 void Board_setBuzzer(bool on)
 {
     if (on) {

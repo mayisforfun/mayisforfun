@@ -1,65 +1,82 @@
-# 天猛星 / 天狼星 IO 对应表
+# 天猛星 IO 对应表
 
-来源文件：`D:\qq\IO口对应.xlsx`。表格名称显示为“天猛星引脚”。如果开发板版本不同，最终以原理图和万用表核对为准。
+来源：`D:\qq\IO口对应.xlsx`。最终以你们实车接线、原理图、万用表测试为准。
 
-## 五路灰度模块
+## 五路灰度
 
-| 模块输出 | 物理位置建议 | MSPM0 引脚 | 建议 SysConfig 名称 | 代码 bit |
-|---|---|---:|---|---:|
-| OUT1 | 最左 L2 | A26 | `GRAY_L2` | 0 |
-| OUT2 | 左中 L1 | A27 | `GRAY_L1` | 1 |
-| OUT3 | 中间 C | A24 | `GRAY_C` | 2 |
-| OUT4 | 右中 R1 | A25 | `GRAY_R1` | 3 |
-| OUT5 | 最右 R2 | B24 | `GRAY_R2` | 4 |
+表格原始 IO：
 
-如果排线方向相反，交换 `GRAY_L2` 与 `GRAY_R2`、`GRAY_L1` 与 `GRAY_R1`。
+| 模块输出 | MSPM0 引脚 | 代码原始名字 |
+|---|---:|---|
+| OUT1 | PA26 | GRAY_L2 |
+| OUT2 | PA27 | GRAY_L1 |
+| OUT3 | PA24 | GRAY_C |
+| OUT4 | PA25 | GRAY_R1 |
+| OUT5 | PB24 | GRAY_R2 |
+
+实测结果：
+
+```text
+全黑 = 0
+全白 = 31
+只 L2 = 15
+只 L1 = 23
+只 C  = 27
+只 R1 = 29
+只 R2 = 30
+```
+
+结论：
+
+- 灰度模块是黑线输出高电平，所以代码使用 `GRAY_BLACK_IS_LOW = 0`。
+- 实车灰度左右方向和代码原始顺序相反，所以 `board_port.c` 已经做了反向映射。
+
+修正后期望：
+
+```text
+全白 = 0
+L2 = 1
+L1 = 2
+C  = 4
+R1 = 8
+R2 = 16
+全黑 = 31
+```
 
 ## TB6612 电机驱动
 
-| TB6612 引脚 | MSPM0 引脚 | 功能 | 建议 SysConfig 名称 |
-|---|---:|---|---|
-| AIN1 | B23 | 左电机方向 1 | `MOTOR_AIN1` |
-| AIN2 | B26 | 左电机方向 2 | `MOTOR_AIN2` |
-| BIN1 | B08 | 右电机方向 1 | `MOTOR_BIN1` |
-| BIN2 | B09 | 右电机方向 2 | `MOTOR_BIN2` |
-| PWMA | A12 | `TIMG0_C0` PWM | `PWM_0` / CC0 |
-| PWMB | A13 | `TIMG0_C1` PWM | `PWM_0` / CC1 |
-| STBY | 3.3 V 或 GPIO | 驱动使能 | 若接 GPIO，建议 `MOTOR_STBY` |
+| TB6612 | MSPM0 引脚 | 功能 |
+|---|---:|---|
+| AIN1 | PB23 | A 通道方向 1 |
+| AIN2 | PB26 | A 通道方向 2 |
+| BIN1 | PB08 | B 通道方向 1 |
+| BIN2 | PB09 | B 通道方向 2 |
+| PWMA | PA12 | TIMG0_C0 PWM |
+| PWMB | PA13 | TIMG0_C1 PWM |
+| STBY | PB27 或接高电平 | 驱动使能 |
 
-当前代码默认：
+当前实车处理：
 
-```text
-AIN1/AIN2/PWMA -> 左电机
-BIN1/BIN2/PWMB -> 右电机
-```
-
-若实车左右通道相反，优先交换电机接线；不方便改线时，再在 `Board_setMotorSpeed()` 中交换 left/right 输出。
+- `MOTOR_FORWARD_SIGN = (-1)`：让代码输出后，车实际往前走。
+- `set_motor_debug()` 里交换了 left/right：适配当前电机左右接线。
 
 ## 编码器预留
 
-| 表格标注 | MSPM0 引脚 | 建议用途 |
-|---|---:|---|
-| 电机 A_L | A00 | 左编码器 A 相，中断 |
-| 电机 B_L | A01 | 左编码器 B 相，方向判定 |
-| 电机 A_R | B04 | 右编码器 A 相，中断 |
-| 电机 B_R | B05 | 右编码器 B 相，方向判定 |
+| 信号 | MSPM0 引脚 |
+|---|---:|
+| 左编码器 A | PA00 |
+| 左编码器 B | PA01 |
+| 右编码器 A | PB04 |
+| 右编码器 B | PB05 |
 
-`encoder.c` 已按 1 倍频方式写好基本计数框架，但默认主循环未接入速度闭环。
+当前主循环还没有接速度闭环，调灰度 PID 时先不用管这里。
 
 ## MPU6050
 
-| 模块引脚 | MSPM0 引脚 | 功能 |
-|---|---:|---|
-| T_SCL | A17 | `I2C1_SCL` |
-| T_SDA | A16 | `I2C1_SDA` |
-| INT | A14 | GPIO 输入，可先不接 |
+| 信号 | MSPM0 引脚 |
+|---|---:|
+| SCL | PA17 |
+| SDA | PA16 |
+| INT | PA14 |
 
-`mpu6050.c` 使用轮询 I2C，基础循迹不依赖 `INT`。
-
-## SysConfig 核对清单
-
-- `GRAY` 输入组：A26、A27、A24、A25、B24。
-- `MOTOR` 输出组：B23、B26、B08、B09。
-- PWM：A12 = `TIMG0_C0`，A13 = `TIMG0_C1`，period/load 与 `MOTOR_PWM_PERIOD_COUNTS` 一致。
-- 若使用 STBY GPIO，上电初始化后必须输出高电平。
-- 若黑线电平与代码相反，改 `GRAY_BLACK_IS_LOW`。
+基础循迹不依赖 MPU6050。
