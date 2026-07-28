@@ -6,7 +6,7 @@
 #include "ti_msp_dl_config.h"
 
 /*
- * Pin mapping from D:\qq\IO¿Ú¶ÔÓ¦.xlsx.
+ * Pin mapping from D:\qq\IO???.xlsx.
  * Gray input order is corrected in board_port.c for the actual car wiring.
  *
  * Gray physical pins:
@@ -145,7 +145,6 @@
 #endif
 #endif
 
-
 #ifndef START_BUTTON_PORT
 #define START_BUTTON_PORT GPIOA
 #endif
@@ -158,6 +157,15 @@
 #ifndef START_BUTTON_ACTIVE_LOW
 #define START_BUTTON_ACTIVE_LOW 1
 #endif
+
+#ifndef STATUS_LED_ENABLE
+#define STATUS_LED_ENABLE 0
+#endif
+
+#ifndef BEEP_ACTIVE_LOW
+#define BEEP_ACTIVE_LOW 1
+#endif
+
 #ifndef BEEP_PORT
 #define BEEP_PORT GPIOB
 #endif
@@ -174,6 +182,8 @@ uint8_t Board_readGray5(void);
 void Board_setMotorSpeed(int16_t left_speed, int16_t right_speed);
 bool Board_readStartButton(void);
 void Board_setBuzzer(bool on);
+void Board_setStatusLed(bool on);
 void Board_delayMs(uint32_t ms);
 
 #endif
+

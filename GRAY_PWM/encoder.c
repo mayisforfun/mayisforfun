@@ -2,12 +2,18 @@
 #include "ti_msp_dl_config.h"
 
 /*
- * Left encoder:  A = PA00 (interrupt), B = PA01 (read-only)
- * Right encoder: A = PB04 (interrupt), B = PB05 (read-only)
+ * Raw wiring from the IO table:
+ *   left encoder  A = PA00, B = PA01
+ *   right encoder A = PB04, B = PB05
  *
- * Counting method: 1x quadrature — interrupt on A-phase rising edge,
- *                  read B-phase level to determine direction.
- *                  B high = forward (+1), B low = backward (-1).
+ * The real car test showed the encoder channels are crossed on the car.
+ * Interrupts still count the raw pins here. The public get functions below
+ * swap/sign-correct the result so main.c sees logical left/right wheel ticks.
+ *
+ * Count method:
+ *   1. Interrupt only on A-phase rising edge.
+ *   2. Read B-phase level inside the interrupt.
+ *   3. B high means +1 raw tick, B low means -1 raw tick.
  */
 
 #define ENC_LEFT_A_PORT  GPIOA
@@ -31,7 +37,9 @@ static int32_t          g_enc_right_last  = 0;
 
 void Encoder_init(void)
 {
-    /* Configure 4 encoder pins as digital inputs with pull-up */
+    /* Configure all encoder pins as input with pull-up.
+     * Pull-up keeps the signal stable when the encoder output is open.
+     */
     DL_GPIO_initDigitalInputFeatures(ENC_LEFT_A_IOMUX,
         DL_GPIO_INVERSION_DISABLE, DL_GPIO_RESISTOR_PULL_UP,
         DL_GPIO_HYSTERESIS_DISABLE, DL_GPIO_WAKEUP_DISABLE);
@@ -45,7 +53,7 @@ void Encoder_init(void)
         DL_GPIO_INVERSION_DISABLE, DL_GPIO_RESISTOR_PULL_UP,
         DL_GPIO_HYSTERESIS_DISABLE, DL_GPIO_WAKEUP_DISABLE);
 
-    /* Rising-edge interrupt on A-phase pins only */
+    /* Only A phase triggers interrupt. B phase is read only for direction. */
     DL_GPIO_setLowerPinsPolarity(ENC_LEFT_A_PORT, DL_GPIO_PIN_0_EDGE_RISE);
     DL_GPIO_clearInterruptStatus(ENC_LEFT_A_PORT, ENC_LEFT_A_PIN);
     DL_GPIO_enableInterrupt(ENC_LEFT_A_PORT, ENC_LEFT_A_PIN);
@@ -56,30 +64,36 @@ void Encoder_init(void)
 
     /* GPIOA/GPIOB interrupts are routed to GROUP1 on MSPM0G3507. */
     NVIC_EnableIRQ(GPIOA_INT_IRQn);
+    NVIC_EnableIRQ(GPIOB_INT_IRQn);
 
-    /* Sync snapshot counters */
+    /* Sync snapshot counters so the first read returns a small delta. */
     g_enc_left_last  = 0;
     g_enc_right_last = 0;
 }
 
 int32_t Encoder_getLeftTicks(void)
 {
-    int32_t current = (int32_t)g_enc_left_ticks;
-    int32_t delta   = current - g_enc_left_last;
-    g_enc_left_last = current;
+    /* Logical left wheel currently comes from the raw right encoder. */
+    int32_t current = (int32_t)g_enc_right_ticks;
+    int32_t delta   = current - g_enc_right_last;
+    g_enc_right_last = current;
     return delta;
 }
 
 int32_t Encoder_getRightTicks(void)
 {
-    int32_t current  = (int32_t)g_enc_right_ticks;
-    int32_t delta    = current - g_enc_right_last;
-    g_enc_right_last = current;
-    return delta;
+    /* Logical right wheel currently comes from the raw left encoder.
+     * The sign is inverted so forward wheel motion becomes positive.
+     */
+    int32_t current = (int32_t)g_enc_left_ticks;
+    int32_t delta   = current - g_enc_left_last;
+    g_enc_left_last = current;
+    return -delta;
 }
 
 void Encoder_clearDeltas(void)
 {
+    /* Drop old movement before starting a new test/run. */
     g_enc_left_last  = (int32_t)g_enc_left_ticks;
     g_enc_right_last = (int32_t)g_enc_right_ticks;
 }
@@ -93,7 +107,7 @@ void GROUP1_IRQHandler(void)
     uint32_t pending = DL_GPIO_getEnabledInterruptStatus(GPIOA, ENC_LEFT_A_PIN);
 
     if (pending != 0U) {
-        /* B-phase high = forward, low = backward */
+        /* B-phase high = +1 raw tick, B-phase low = -1 raw tick. */
         if ((DL_GPIO_readPins(ENC_LEFT_B_PORT, ENC_LEFT_B_PIN) &
              ENC_LEFT_B_PIN) != 0U) {
             g_enc_left_ticks++;
@@ -106,6 +120,7 @@ void GROUP1_IRQHandler(void)
     pending = DL_GPIO_getEnabledInterruptStatus(GPIOB, ENC_RIGHT_A_PIN);
 
     if (pending != 0U) {
+        /* Same rule for the raw right encoder. Logical fix is done on read. */
         if ((DL_GPIO_readPins(ENC_RIGHT_B_PORT, ENC_RIGHT_B_PIN) &
              ENC_RIGHT_B_PIN) != 0U) {
             g_enc_right_ticks++;

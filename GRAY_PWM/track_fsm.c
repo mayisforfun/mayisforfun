@@ -1,5 +1,6 @@
 #include "track_fsm.h"
 
+/* Track-state thresholds. The loop period is 10 ms, so 8 cycles = 80 ms. */
 #define ERROR_CURVE_ENTER  700
 #define ERROR_CURVE_EXIT   300
 #define CURVE_ENTER_CYCLES 3
@@ -15,6 +16,10 @@ void TrackFSM_init(TrackFSM *fsm)
     fsm->base_speed        = 310;
     fsm->state_counter     = 0;
     fsm->confirm_threshold = CURVE_ENTER_CYCLES;
+
+    /* These speeds are base speeds only. line_follow still creates left/right
+     * differential speed, and speed_control may add final PWM correction.
+     */
     fsm->straight_speed    = 310;
     fsm->curve_speed       = 230;
     fsm->cross_speed       = 210;
@@ -26,6 +31,13 @@ static int16_t abs_i16(int16_t v)
     return (v >= 0) ? v : (int16_t) -v;
 }
 
+/*
+ * Decide which track section we are in:
+ * STRAIGHT: normal centered line.
+ * CURVE: line error is large for several cycles.
+ * CROSS: all five sensors see black.
+ * LOST: no sensor sees black for several cycles.
+ */
 void TrackFSM_update(TrackFSM *fsm, const LineFollowState *line,
                      uint16_t *out_base_speed)
 {
