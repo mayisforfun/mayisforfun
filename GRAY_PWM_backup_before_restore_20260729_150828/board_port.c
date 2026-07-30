@@ -26,6 +26,16 @@
 #define RIGHT_PWM_CC_INDEX DL_TIMER_CC_1_INDEX
 #endif
 
+#if SERVO_PWM_ENABLE
+#ifndef SERVO_PWM_INST
+#error "SERVO_PWM_ENABLE=1 时必须定义 SERVO_PWM_INST"
+#endif
+
+#ifndef SERVO_PWM_CC_INDEX
+#error "SERVO_PWM_ENABLE=1 时必须定义 SERVO_PWM_CC_INDEX"
+#endif
+#endif
+
 #if (GRAY_SAMPLE_COUNT == 0U) || ((GRAY_SAMPLE_COUNT % 2U) == 0U)
 #error "GRAY_SAMPLE_COUNT must be a non-zero odd number"
 #endif
@@ -56,6 +66,37 @@ static void set_pwm_duty(GPTIMER_Regs *timer, DL_TIMER_CC_INDEX cc_index, uint16
     DL_TimerG_setCaptureCompareValue(timer,
                                      compare_value,
                                      cc_index);
+}
+
+/* 输出舵机脉宽。
+ *
+ * 舵机使用 50Hz PWM：周期 20ms，高电平通常 1000~2000us。
+ * 注意：电机 PWM 周期很短，不能直接拿电机 PWM 通道驱动舵机。
+ */
+static void set_servo_pulse_us(uint16_t pulse_us)
+{
+#if SERVO_PWM_ENABLE
+    uint32_t ticks = ((uint32_t) pulse_us * SERVO_PWM_TIMER_CLK_HZ +
+                      500000U) / 1000000U;
+    uint32_t compare_value;
+
+    if (ticks > SERVO_PWM_PERIOD_COUNTS) {
+        ticks = SERVO_PWM_PERIOD_COUNTS;
+    }
+
+#if SERVO_PWM_COMPARE_IS_INVERTED
+    compare_value = SERVO_PWM_PERIOD_COUNTS - ticks;
+#else
+    compare_value = ticks;
+#endif
+
+    DL_TimerG_setCaptureCompareValue(SERVO_PWM_INST,
+                                     (uint16_t) compare_value,
+                                     SERVO_PWM_CC_INDEX);
+#else
+    /* 还没有配置舵机 PWM 硬件时，保留空实现，方便先编译和写上层算法。 */
+    (void) pulse_us;
+#endif
 }
 
 /* TB6612 A channel direction. Logical forward is corrected in main.c. */
@@ -113,6 +154,11 @@ void Board_init(void)
     if (LEFT_PWM_INST != RIGHT_PWM_INST) {
         DL_TimerG_startCounter(RIGHT_PWM_INST);
     }
+
+    Board_setServoPulseUs(SERVO_PWM_CENTER_PULSE_US);
+#if SERVO_PWM_ENABLE
+    DL_TimerG_startCounter(SERVO_PWM_INST);
+#endif
 
     /* 100 Hz control loop: one control update every 10 ms. */
     SysTick->LOAD  = (CPUCLK_FREQ / 100U) - 1U;
@@ -220,6 +266,11 @@ void Board_setMotorSpeed(int16_t left_speed, int16_t right_speed)
 
     set_pwm_duty(LEFT_PWM_INST, LEFT_PWM_CC_INDEX, left_duty);
     set_pwm_duty(RIGHT_PWM_INST, RIGHT_PWM_CC_INDEX, right_duty);
+}
+
+void Board_setServoPulseUs(uint16_t pulse_us)
+{
+    set_servo_pulse_us(pulse_us);
 }
 
 /* Any configured key can start/stop the car. Keys are treated as active low. */

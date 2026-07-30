@@ -1,71 +1,71 @@
 #include "speed_control.h"
 
+/*
+ * 单轮速度 PID。
+ *
+ * 这个控制器只在循迹给出的轮速命令附近做小幅修正。
+ * 循迹算法负责决定小车往哪里走；速度闭环只负责让真实轮速
+ * 尽量跟上目标编码器 tick。
+ */
+
+/* 初始化一个单轮 PID 控制器。
+ * 增益使用 Q10 定点数：真实增益 = gain_q10 / 1024。
+ */
 void SpeedPID_init(SpeedPID *pid, int16_t kp_q10, int16_t ki_q10,
                    int16_t kd_q10, int16_t max_output)
 {
-    /* Q10 means real gain = value / 1024.
-     * Example: kp_q10 = 180 means Kp is about 0.176.
-     */
-    pid->kp_q10     = kp_q10;
-    pid->ki_q10     = ki_q10;
-    pid->kd_q10     = kd_q10;
+    pid->kp_q10 = kp_q10;
+    pid->ki_q10 = ki_q10;
+    pid->kd_q10 = kd_q10;
     pid->max_output = max_output;
-    pid->integral   = 0;
+    pid->integral = 0;
     pid->last_error = 0;
 }
 
+/* 计算单个车轮的 PWM 修正量。
+ *
+ * target 和 actual 使用同一个单位：每个控制周期的编码器 tick 数。
+ * 返回值会在 main.c 中叠加到原始开环 PWM 命令上。
+ */
 int16_t SpeedPID_compute(SpeedPID *pid, int16_t target, int16_t actual)
 {
-    /* target: wanted encoder ticks in this control cycle.
-     * actual: measured encoder ticks in this control cycle.
-     * output: PWM correction added to the open-loop PWM command.
-     */
-    int16_t error = target - actual;
-    int16_t derivative = error - pid->last_error;
-    int32_t correction;
-    int32_t i_term = 0;
+    /* 误差为正，表示当前轮子比目标慢，需要加 PWM。 */
+    int16_t error = (int16_t) (target - actual);
+
+    /* 误差变化量是 D 项输入，用来抑制速度突变。 */
+    int16_t error_delta = (int16_t) (error - pid->last_error);
+    int32_t output;
 
     pid->last_error = error;
 
-    if (pid->ki_q10 != 0) {
-        /* Anti-windup: limit integral so the I term cannot hold a huge output
-         * after the wheel was blocked or lifted for a while.
-         */
-        int32_t max_integral = ((int32_t)pid->max_output * 1024) / pid->ki_q10;
-        if (max_integral < 100) {
-            max_integral = 100;
-        }
+    /* 积分项用于消除左右电机长期不一致。 */
+    pid->integral += error;
 
-        pid->integral += error;
-        if (pid->integral > max_integral) {
-            pid->integral = max_integral;
-        } else if (pid->integral < -max_integral) {
-            pid->integral = -max_integral;
-        }
-
-        i_term = (int32_t)pid->ki_q10 * pid->integral;
-    } else {
-        /* Ki is intentionally kept at 0 during early tuning. */
-        pid->integral = 0;
+    /* 积分抗饱和：轮子卡住时不能积累出很大的历史修正。 */
+    if (pid->integral > SPEED_PID_INTEGRAL_LIMIT) {
+        pid->integral = SPEED_PID_INTEGRAL_LIMIT;
+    } else if (pid->integral < -SPEED_PID_INTEGRAL_LIMIT) {
+        pid->integral = -SPEED_PID_INTEGRAL_LIMIT;
     }
 
-    correction = ((int32_t)pid->kp_q10 * error +
-                  i_term +
-                  (int32_t)pid->kd_q10 * derivative) / 1024;
+    /* Q10 定点 PID 输出。实车上 Ki 要小，避免和循迹抢控制权。 */
+    output = ((int32_t) pid->kp_q10 * error +
+              (int32_t) pid->ki_q10 * pid->integral +
+              (int32_t) pid->kd_q10 * error_delta) / 1024L;
 
-    /* Keep the speed loop as a small correction, not the main driver. */
-    if (correction > pid->max_output) {
-        correction = pid->max_output;
-    } else if (correction < -pid->max_output) {
-        correction = -pid->max_output;
+    /* 速度环不能压过转向环，所以要限制最大修正量。 */
+    if (output > pid->max_output) {
+        output = pid->max_output;
+    } else if (output < -pid->max_output) {
+        output = -pid->max_output;
     }
 
-    return (int16_t)correction;
+    return (int16_t) output;
 }
 
+/* 停车、重新起步或切换模式时，清空 PID 历史状态。 */
 void SpeedPID_reset(SpeedPID *pid)
 {
-    /* Call this when enabling the car or changing modes. */
-    pid->integral   = 0;
+    pid->integral = 0;
     pid->last_error = 0;
 }

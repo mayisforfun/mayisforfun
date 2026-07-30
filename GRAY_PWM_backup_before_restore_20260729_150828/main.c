@@ -8,26 +8,53 @@
 #include "bluetooth_uart.h"
 #include "mpu6050.h"
 #include "oled_debug.h"
+#include "servo_control.h"
 
+/* 诊断模式开关。正常比赛运行时都保持为 0。
+ * 检查电机方向、编码器或 IMU 时，一次只打开一个诊断模式。
+ */
 #define MOTOR_DIAGNOSTIC_MODE   0
 #define ENCODER_DIAGNOSTIC_MODE 0
 #define MPU_DIAGNOSTIC_MODE     0
 #define MOTOR_TEST_SPEED      500
 #define ENCODER_TEST_SPEED    260
+
+/* 速度闭环开关和单轮速度 PID 参数。
+ * Q10 表示真实增益 = 参数值 / 1024。速度环只做温和修正：
+ * SPEED_PID_MAX_OUTPUT 过大会和循迹转向抢控制权，导致小车摆头。
+ */
 #define SPEED_CLOSED_LOOP_ENABLE 1
 #define SPEED_TARGET_TICKS_PER_1000 30
-#define SPEED_PID_KP_Q10      120
-#define SPEED_PID_KI_Q10      0
+#define SPEED_PID_KP_Q10      90
+#define SPEED_PID_KI_Q10      8
 #define SPEED_PID_KD_Q10      0
-#define SPEED_PID_MAX_OUTPUT  45
+#define SPEED_PID_MAX_OUTPUT  35
+
+/* 板级电机校准参数。
+ * MOTOR_FORWARD_SIGN 用来修正电机正反方向。
+ * MOTOR_OUTPUT_SWAP 用来修正左右通道接反。
+ * 最小运行速度用于避免 PWM 太小时电机只响不动。
+ */
 #define MOTOR_FORWARD_SIGN    (-1)
 #define MOTOR_OUTPUT_SWAP     1
 #define MOTOR_MIN_RUN_SPEED   260
 #define MOTOR_MIN_RUN_SPEED_SLOW 180
+
+/* 按键消抖：按键必须连续按下这么多个控制周期，
+ * 才会被认为是一次有效按键事件。
+ */
 #define BUTTON_DEBOUNCE_TICKS 3U
+
+/* 横线停车测试。全黑需要持续多个周期，
+ * 避免单次噪声误触发停车。
+ */
 #define CROSS_STOP_TEST_ENABLE 1
 #define CROSS_STOP_FULL_BLACK_TICKS 2U
 #define BT_HEARTBEAT_TEST_ENABLE 0
+
+/* 2024 风格任务参数。TASK_TICKS_PER_CM 必须在真实场地上标定，
+ * 它会受到地面、电池电压、轮胎和编码器安装的影响。
+ */
 #define TASK2024_ENABLE       1
 #define TASK_TICKS_PER_CM     30L
 #define TASK1_TEST_CM         130
@@ -51,15 +78,36 @@
 #define TASK_SEARCH_START_PERCENT 60L
 #define TASK_SEARCH_SWING_DEG_X100 1200L
 #define TASK_SEARCH_HALF_PERIOD_TICKS 35L
+
+/* H 题停车线图案。
+ * 实际停车黑线大约只有 5 cm，所以不能死等五路全黑。
+ * 这里接受中心附近任意三个连续黑点，提高短线识别成功率。
+ */
 #define H_TASK2_STOP_LEFT3    ((1U << 0) | (1U << 1) | (1U << 2))
 #define H_TASK2_STOP_MID3     ((1U << 1) | (1U << 2) | (1U << 3))
 #define H_TASK2_STOP_RIGHT3   ((1U << 2) | (1U << 3) | (1U << 4))
+
+/* H 题末端慢速区。编码器估算距离到达这里后降低基础速度，
+ * 让 5 cm 短黑线更容易被稳定识别。
+ */
 #define H_TASK2_SLOW_START_CM 230L
 #define H_TASK2_SLOW_SPEED    220U
 #define H_TASK2_SLOW_SETTLE_TICKS 25U
 #define H_TASK2_STOP_TICKS    2U
 #define H_TASK2_RELEASE_TICKS 10U
 #define OLED_UPDATE_TICKS     10U
+
+/* 小球水管舵机基础参数。
+ * 这里先只把舵机控制层搭好：上电回中、角度限幅、输出平滑。
+ * 后面接视觉后，视觉位置 PID 的输出直接调用 ServoControl_setOffsetDegX10()。
+ */
+#define BALL_SERVO_MIN_ANGLE_X10     600
+#define BALL_SERVO_CENTER_ANGLE_X10  900
+#define BALL_SERVO_MAX_ANGLE_X10     1200
+#define BALL_SERVO_MIN_PULSE_US      1000U
+#define BALL_SERVO_CENTER_PULSE_US   1500U
+#define BALL_SERVO_MAX_PULSE_US      2000U
+#define BALL_SERVO_MAX_STEP_US       20U
 
 volatile bool     g_ctrl_flag = false;
 volatile uint32_t g_sys_ticks = 0;
@@ -155,15 +203,33 @@ volatile int32_t  g_h_task2_slow_start_ticks = 0;
 volatile bool     g_h_task2_finish_candidate = false;
 volatile bool     g_h_task2_slow_mode = false;
 volatile uint8_t  g_h_task2_slow_ticks = 0;
+volatile int16_t  g_ball_servo_angle_x10 = BALL_SERVO_CENTER_ANGLE_X10;
+volatile uint16_t g_ball_servo_pulse_us = BALL_SERVO_CENTER_PULSE_US;
+
+static const ServoControlConfig g_ball_servo_config = {
+    .min_angle_x10    = BALL_SERVO_MIN_ANGLE_X10,
+    .center_angle_x10 = BALL_SERVO_CENTER_ANGLE_X10,
+    .max_angle_x10    = BALL_SERVO_MAX_ANGLE_X10,
+    .min_pulse_us     = BALL_SERVO_MIN_PULSE_US,
+    .center_pulse_us  = BALL_SERVO_CENTER_PULSE_US,
+    .max_pulse_us     = BALL_SERVO_MAX_PULSE_US,
+    .max_step_us      = BALL_SERVO_MAX_STEP_US,
+    .invert           = false,
+};
 
 #if !MOTOR_DIAGNOSTIC_MODE
+/* 主循迹参数。
+ * base_speed 是直线基础速度，max_speed 是双轮速度上限。
+ * Kp 决定转向力度，Kd 用来压住左右摆头。
+ * Ki 保持为 0，因为灰度循迹通常不希望长期积累转向误差。
+ */
 static LineFollowConfig g_line_config = {
-    .base_speed      = 360,
-    .max_speed       = 600,
-    .kp_q10          = 55,
+    .base_speed      = 320,
+    .max_speed       = 560,
+    .kp_q10          = 80,
     .ki_q10          = 0,
-    .kd_q10          = 70,
-    .lost_turn_speed = 220,
+    .kd_q10          = 120,
+    .lost_turn_speed = 180,
 };
 #endif
 
@@ -184,6 +250,11 @@ static uint8_t count_black_sensors5(uint8_t bits)
     return count;
 }
 
+/* 判断当前灰度图案是否像 H 题末端短停车线。
+ * 停车线很窄，如果强制要求 L1+C+R1 完全同时为黑，
+ * 车身一摆就会漏检。因此这里接受三路连续黑、中心加足够黑区、
+ * 或者任意四路黑。
+ */
 static bool h_task2_is_stop_line(uint8_t sensor_bits)
 {
     uint8_t bits = sensor_bits & 0x1FU;
@@ -201,11 +272,17 @@ static bool h_task2_is_stop_line(uint8_t sensor_bits)
     return count_black_sensors5(bits) >= 4U;
 }
 
+/* 使用左右轮绝对编码器距离的平均值。
+ * 这样在转弯或单侧轻微打滑时，比只相信某一侧更稳定。
+ */
 static int32_t h_task2_get_travel_ticks(void)
 {
     return (abs_i32(g_encoder_left_total) + abs_i32(g_encoder_right_total)) / 2L;
 }
 
+/* 只重置 H 题停车线和慢速区状态。
+ * 通用循迹状态和速度 PID 状态由 reset_control_state() 统一重置。
+ */
 static void h_task2_reset_stop_state(void)
 {
     g_h_task2_travel_ticks = 0;
@@ -216,6 +293,9 @@ static void h_task2_reset_stop_state(void)
     g_h_task2_stop_ticks = 0;
 }
 
+/* 启动 H 题任务 2：先从起始黑线释放出来，
+ * 然后在设定行驶距离之后再开始寻找末端停车线。
+ */
 static void h_task2_start(void)
 {
     g_h_task2_active = true;
@@ -228,6 +308,7 @@ static void h_task2_start(void)
     h_task2_reset_stop_state();
 }
 
+/* 停止 H 题任务 2，并记录耗时，供 OLED/调试显示使用。 */
 static void h_task2_stop(void)
 {
     g_h_task2_active = false;
@@ -238,6 +319,12 @@ static void h_task2_stop(void)
     g_run_enabled = false;
 }
 
+/* 短停车线识别状态机：
+ *   1. 起步时先忽略初始黑线，直到小车完全离开它。
+ *   2. 到达慢速区距离前正常行驶。
+ *   3. 进入慢速区后降速，并等待几个周期让车身稳定。
+ *   4. 停车图案必须连续出现若干周期，才真正停车。
+ */
 static bool h_task2_should_stop(uint8_t sensor_bits)
 {
     bool stop_line_seen = h_task2_is_stop_line(sensor_bits);
@@ -714,7 +801,7 @@ static void imu_update_heading(void)
     g_mpu_gyro_z_mdps = scaled.gyro_z_mdps;
     corrected_z = scaled.gyro_z_mdps - g_mpu_gyro_z_bias_mdps;
 
-    /* Loop period is 10 ms. mdps * 10ms / 10000 = degrees * 100. */
+    /* 控制周期是 10 ms。mdps * 10ms / 10000 = 角度 * 100。 */
     g_mpu_yaw_deg_x100 += corrected_z / 1000L;
 }
 
@@ -866,11 +953,17 @@ static int16_t speed_to_target_ticks(int16_t speed)
     return (int16_t) (((int32_t) speed * SPEED_TARGET_TICKS_PER_1000) / 1000);
 }
 
+/* 把每个控制周期的编码器 tick 换算成近似 cm/s，用于调试显示。
+ * 它共用 TASK_TICKS_PER_CM，所以重新标定距离后这个显示也会更准。
+ */
 static int16_t speed_ticks_to_cms(int16_t ticks_per_loop)
 {
     return (int16_t) (((int32_t) ticks_per_loop * 100L) / TASK_TICKS_PER_CM);
 }
 
+/* 在 PID 修正后套用最小运行 PWM。
+ * 低于这个值时电机可能只响不动，会破坏编码器反馈和直线校准。
+ */
 static int16_t apply_motor_min_run_speed(int16_t speed)
 {
     int16_t min_run_speed = g_h_task2_slow_mode ?
@@ -888,6 +981,7 @@ static int16_t apply_motor_min_run_speed(int16_t speed)
     return speed;
 }
 
+/* 清空 OLED 和蓝牙状态里显示的编码器/速度调试量。 */
 static void reset_speed_debug(void)
 {
     g_encoder_left_delta = 0;
@@ -904,6 +998,9 @@ static void reset_speed_debug(void)
     g_speed_right_pwm = 0;
 }
 
+/* 在 GO、STOP 或任务切换前，把所有控制器恢复到确定状态。
+ * 这样旧的 PID 积分、横线锁存和编码器累计值不会影响下一次运行。
+ */
 static void reset_control_state(LineFollowState *line_state,
                                 TrackFSM *track_fsm,
                                 CrossDetector *cross_detector,
@@ -1065,17 +1162,26 @@ static void set_motor_speed_closed_loop(SpeedPID *left_pid, SpeedPID *right_pid,
     int16_t left_pwm = left_target;
     int16_t right_pwm = right_target;
 
+    /* 先读取并累计编码器增量。
+     * 循迹、H 题距离、OLED 和速度 PID 都使用同一份最新测量值。
+     */
     g_encoder_left_delta = Encoder_getLeftTicks();
     g_encoder_right_delta = Encoder_getRightTicks();
     g_encoder_left_total += g_encoder_left_delta;
     g_encoder_right_total += g_encoder_right_delta;
 
+    /* 把逻辑 PWM 目标换算成编码器 tick 目标。
+     * 换算故意保持简单，方便直接在赛道上调 SPEED_TARGET_TICKS_PER_1000。
+     */
     g_speed_left_actual_ticks = clamp_i16(g_encoder_left_delta, -32768, 32767);
     g_speed_right_actual_ticks = clamp_i16(g_encoder_right_delta, -32768, 32767);
     g_speed_left_target_ticks = speed_to_target_ticks(left_target);
     g_speed_right_target_ticks = speed_to_target_ticks(right_target);
 
 #if SPEED_CLOSED_LOOP_ENABLE
+    /* 只要某个轮子的目标速度为 0，就重置该轮 PID。
+     * 否则历史积分会在下一次起步时突然给车一个冲击。
+     */
     if (left_target == 0) {
         SpeedPID_reset(left_pid);
         g_speed_left_correction = 0;
@@ -1099,9 +1205,12 @@ static void set_motor_speed_closed_loop(SpeedPID *left_pid, SpeedPID *right_pid,
     }
 #else
     g_speed_left_correction = 0;
-    g_speed_right_correction = 0;
+        g_speed_right_correction = 0;
 #endif
 
+    /* 最小 PWM 放在最后处理。
+     * 这样 PID 仍围绕原始逻辑目标计算，而实际电机又能拿到足够启动的 PWM。
+     */
     left_pwm = apply_motor_min_run_speed(left_pwm);
     right_pwm = apply_motor_min_run_speed(right_pwm);
     g_speed_left_pwm = left_pwm;
@@ -1239,6 +1348,7 @@ int main(void)
     CrossDetector cross_detector;
     RunIndicator run_indicator;
     BluetoothUART bt_uart;
+    ServoControl ball_servo;
 #if TASK2024_ENABLE
     Task2024State task2024;
 #endif
@@ -1257,6 +1367,9 @@ int main(void)
     CrossDetector_init(&cross_detector);
     RunIndicator_init(&run_indicator);
     BluetoothUART_init(&bt_uart);
+    ServoControl_init(&ball_servo, &g_ball_servo_config);
+    g_ball_servo_angle_x10 = ServoControl_getCurrentAngleDegX10(&ball_servo);
+    g_ball_servo_pulse_us = ServoControl_getCurrentPulseUs(&ball_servo);
 #if TASK2024_ENABLE
     Task2024_reset(&task2024);
     imu_init_debug();
@@ -1292,6 +1405,14 @@ int main(void)
             update_bluetooth_debug(&bt_uart, bt_line, BluetoothUART_getCommand(&bt_uart), false);
         }
         bluetooth_send_heartbeat_if_needed();
+
+        /* 舵机控制先独立刷新。
+         * 现在目标默认保持中位；后面接视觉 PID 时，只需要在这里之前
+         * 根据小球位置调用 ServoControl_setOffsetDegX10()。
+         */
+        ServoControl_update(&ball_servo);
+        g_ball_servo_angle_x10 = ServoControl_getCurrentAngleDegX10(&ball_servo);
+        g_ball_servo_pulse_us = ServoControl_getCurrentPulseUs(&ball_servo);
 
 #if TASK2024_ENABLE
         for (uint8_t key_id = 1U; key_id <= 4U; key_id++) {
