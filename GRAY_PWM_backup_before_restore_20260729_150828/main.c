@@ -6,7 +6,7 @@
 #include "cross_detector.h"
 #include "run_indicator.h"
 #include "bluetooth_uart.h"
-#include "k230_uart.h"
+#include "uart.h"
 #include "mpu6050.h"
 #include "oled_debug.h"
 #include "servo_control.h"
@@ -75,12 +75,14 @@
 /* H 题末端慢速区。编码器估算距离到达这里后降低基础速度，
  * 让 5 cm 短黑线更容易被稳定识别。
  */
-#define H_TASK2_SLOW_START_CM 230L
+#define H_TASK2_SLOW_START_CM 300L
 #define H_TASK2_SLOW_SPEED    220U
+#define H_TASK2_FORCE_STOP_CM 352L
 #define H_TASK2_SLOW_SETTLE_TICKS 25U
 #define H_TASK2_STOP_TICKS    2U
 #define H_TASK2_RELEASE_TICKS 10U
 #define OLED_UPDATE_TICKS     10U
+#define K230_FRESH_TIMEOUT_TICKS 50U
 
 /* 小球水管舵机基础参数。
  *
@@ -298,12 +300,6 @@ static const ServoControlConfig g_ball_servo_config = {
     .invert           = false,
 };
 
-/* K230 接收状态必须放在全局区。
- * UART1 中断负责第一时间把收到的字节塞进这个状态机；
- * 主循环只负责读取它并更新 g_k230_* 调试变量。
- */
-static volatile K230UART g_k230_uart_state;
-
 /* 主循迹参数。
  * base_speed 是直线基础速度，max_speed 是双轮速度上限。
  * Kp 决定转向力度，Kd 用来压住左右摆头。
@@ -450,6 +446,16 @@ static bool h_task2_should_stop(uint8_t sensor_bits)
         g_h_task2_slow_ticks++;
     }
 
+    /* 灰度终点线较短且每次覆盖的探头数量不稳定。
+     * 编码器比例虽然不准确，但实测代码距离约 340 时已接近终点，
+     * 因此在完成末段稳定等待后用它作为停车兜底。
+     */
+    if ((g_h_task2_slow_ticks >= H_TASK2_SLOW_SETTLE_TICKS) &&
+        (g_h_task2_travel_ticks >=
+         (H_TASK2_FORCE_STOP_CM * TASK_TICKS_PER_CM))) {
+        return true;
+    }
+
     g_h_task2_finish_candidate =
         (g_h_task2_slow_ticks >= H_TASK2_SLOW_SETTLE_TICKS) && stop_line_seen;
 
@@ -521,35 +527,37 @@ static void update_bluetooth_debug(BluetoothUART *bt,
     }
 }
 
-/* 更新 K230 视觉坐标调试量。
- * 这些 g_k230_* 变量主要给 CCS 表达式窗口、OLED 或蓝牙查询使用。
- * position_valid 表示“至少收到过一帧正确坐标”；
- * position_fresh 表示“最近 K230_UART_TIMEOUT_TICKS 内收到过坐标”，
- * 后面小球 PID 应该优先看 fresh，避免视觉断流时舵机继续追旧坐标。
+/* 简单串口调试量同步。
+ * 现在 uart.c 只保留最基础的“收 1 个字节、存最近 8 个字节”。
+ * 为了不让 CCS 表达式窗口里的旧变量全部失效，这里继续把原始串口数据
+ * 映射到 g_k230_rx_count / g_k230_raw0~7 / g_k230_last_byte 这些旧名字上。
  */
-static void update_k230_debug(volatile K230UART *k230)
+static void update_k230_debug(void)
 {
-    g_k230_position_valid = k230->position_valid;
-    g_k230_position_fresh = K230UART_isFresh(k230, g_sys_ticks);
-    g_k230_frame_event = K230UART_hasNewFrame(k230);
-    g_k230_center_x = k230->center_x;
-    g_k230_center_y = k230->center_y;
-    g_k230_rx_count = k230->rx_count;
-    g_k230_frame_count = k230->frame_count;
-    g_k230_bad_frame_count = k230->bad_frame_count;
-    g_k230_last_frame_ticks = k230->last_frame_tick;
-    g_k230_last_byte = k230->last_byte;
-    g_k230_parse_state = (uint8_t) k230->parse_state;
-    g_k230_raw_index = k230->raw_index;
+    static uint32_t previous_frame_count = 0U;
+
+    g_k230_rx_count = g_uart_rx_count;
+    g_k230_last_byte = g_uart_rx_data;
+    g_k230_raw_index = g_uart_rx_index;
+    g_k230_frame_event = (g_k230_frame_count != previous_frame_count);
+    previous_frame_count = g_k230_frame_count;
+
+    if (g_k230_position_valid &&
+        ((uint32_t) (g_sys_ticks - g_k230_last_frame_ticks) >
+         K230_FRESH_TIMEOUT_TICKS)) {
+        g_k230_position_fresh = false;
+    }
+
     for (uint8_t i = 0U; i < K230_UART_RAW_DEBUG_SIZE; i++) {
-        uint8_t ordered_index = (uint8_t) (k230->raw_index + i);
+        uint8_t ordered_index = (uint8_t) (g_uart_rx_index + i);
         if (ordered_index >= K230_UART_RAW_DEBUG_SIZE) {
             ordered_index = (uint8_t) (ordered_index - K230_UART_RAW_DEBUG_SIZE);
         }
 
-        g_k230_raw_bytes[i] = k230->raw_bytes[i];
-        g_k230_raw_last8[i] = k230->raw_bytes[ordered_index];
+        g_k230_raw_bytes[i] = g_uart_rx_buffer[i];
+        g_k230_raw_last8[i] = g_uart_rx_buffer[ordered_index];
     }
+
     g_k230_raw0 = g_k230_raw_last8[0];
     g_k230_raw1 = g_k230_raw_last8[1];
     g_k230_raw2 = g_k230_raw_last8[2];
@@ -558,82 +566,6 @@ static void update_k230_debug(volatile K230UART *k230)
     g_k230_raw5 = g_k230_raw_last8[5];
     g_k230_raw6 = g_k230_raw_last8[6];
     g_k230_raw7 = g_k230_raw_last8[7];
-    g_k230_frame0 = k230->last_frame[0];
-    g_k230_frame1 = k230->last_frame[1];
-    g_k230_frame2 = k230->last_frame[2];
-    g_k230_frame3 = k230->last_frame[3];
-    g_k230_frame4 = k230->last_frame[4];
-    g_k230_frame5 = k230->last_frame[5];
-    g_k230_frame6 = k230->last_frame[6];
-    g_k230_frame7 = k230->last_frame[7];
-    g_k230_sync0 = k230->sync_window[0];
-    g_k230_sync1 = k230->sync_window[1];
-    g_k230_sync2 = k230->sync_window[2];
-    g_k230_sync3 = k230->sync_window[3];
-    g_k230_sync4 = k230->sync_window[4];
-    g_k230_sync5 = k230->sync_window[5];
-    g_k230_sync6 = k230->sync_window[6];
-    g_k230_sync7 = k230->sync_window[7];
-    g_k230_sync_count = k230->sync_count;
-
-    K230UART_clearNewFrame(k230);
-}
-
-/* 开启 K230 串口接收中断。
- * 之前只靠主循环每 10ms 轮询一次，115200 波特率下一帧 8 字节不到 1ms 就发完，
- * UART FIFO 来不及保存整帧，所以你会看到每发一次只收到最后的 0xFF。
- */
-static void k230_uart_enable_rx_interrupt(void)
-{
-#if K230_UART_ENABLE
-#ifndef K230_UART_INST
-#error "K230_UART_ENABLE is 1, but K230_UART_INST is not defined."
-#endif
-#ifndef K230_INST_INT_IRQN
-#error "K230 UART IRQ number is not defined. Check SysConfig instance name."
-#endif
-    DL_UART_Main_enableInterrupt(K230_UART_INST,
-        DL_UART_MAIN_INTERRUPT_RX |
-        DL_UART_MAIN_INTERRUPT_RX_TIMEOUT_ERROR |
-        DL_UART_MAIN_INTERRUPT_OVERRUN_ERROR |
-        DL_UART_MAIN_INTERRUPT_FRAMING_ERROR |
-        DL_UART_MAIN_INTERRUPT_NOISE_ERROR);
-
-    NVIC_ClearPendingIRQ(K230_INST_INT_IRQN);
-    NVIC_EnableIRQ(K230_INST_INT_IRQN);
-#endif
-}
-
-/* K230 UART1 接收中断。
- * 尽量只做“读字节 + 推状态机”这件事，避免中断里执行复杂控制逻辑。
- */
-void UART1_IRQHandler(void)
-{
-#if K230_UART_ENABLE
-    switch (DL_UART_Main_getPendingInterrupt(K230_UART_INST)) {
-    case DL_UART_MAIN_IIDX_RX:
-    case DL_UART_MAIN_IIDX_RX_TIMEOUT_ERROR:
-        while (!DL_UART_Main_isRXFIFOEmpty(K230_UART_INST)) {
-            uint8_t byte = DL_UART_Main_receiveData(K230_UART_INST);
-            K230UART_pushByte(&g_k230_uart_state, byte, g_sys_ticks);
-        }
-        break;
-
-    case DL_UART_MAIN_IIDX_OVERRUN_ERROR:
-    case DL_UART_MAIN_IIDX_FRAMING_ERROR:
-    case DL_UART_MAIN_IIDX_NOISE_ERROR:
-        g_k230_uart_state.bad_frame_count++;
-        K230UART_resetParser(&g_k230_uart_state);
-        while (!DL_UART_Main_isRXFIFOEmpty(K230_UART_INST)) {
-            uint8_t byte = DL_UART_Main_receiveData(K230_UART_INST);
-            K230UART_pushByte(&g_k230_uart_state, byte, g_sys_ticks);
-        }
-        break;
-
-    default:
-        break;
-    }
-#endif
 }
 
 static void set_motor_debug(int16_t left, int16_t right)
@@ -1434,8 +1366,7 @@ int main(void)
     CrossDetector_init(&cross_detector);
     RunIndicator_init(&run_indicator);
     BluetoothUART_init(&bt_uart);
-    K230UART_init(&g_k230_uart_state);
-    k230_uart_enable_rx_interrupt();
+    UART1_enableRxInterrupt();
     ServoControl_init(&ball_servo, &g_ball_servo_config);
     g_ball_servo_angle_x10 = ServoControl_getCurrentAngleDegX10(&ball_servo);
     g_ball_servo_pulse_us = ServoControl_getCurrentPulseUs(&ball_servo);
@@ -1457,8 +1388,8 @@ int main(void)
         g_ctrl_flag = false;
 
         BluetoothUART_poll(&bt_uart);
-        K230UART_poll(&g_k230_uart_state, g_sys_ticks);
-        update_k230_debug(&g_k230_uart_state);
+        UART1_poll();
+        update_k230_debug();
 #if TASK2024_ENABLE
         if (task2024.active || g_h_task2_active) {
             imu_update_heading();

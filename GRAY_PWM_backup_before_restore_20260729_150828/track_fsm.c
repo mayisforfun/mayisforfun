@@ -20,8 +20,8 @@ void TrackFSM_init(TrackFSM *fsm)
     /* These speeds are base speeds only. line_follow still creates left/right
      * differential speed, and speed_control may add final PWM correction.
      */
-    fsm->straight_speed    = 380;
-    fsm->curve_speed       = 270;
+    fsm->straight_speed    = 520;
+    fsm->curve_speed       = 350;
     fsm->cross_speed       = 210;
     fsm->lost_speed        = 170;
 }
