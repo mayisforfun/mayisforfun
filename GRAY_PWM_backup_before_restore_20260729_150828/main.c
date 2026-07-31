@@ -6,31 +6,44 @@
 #include "cross_detector.h"
 #include "run_indicator.h"
 #include "bluetooth_uart.h"
+#include "k230_uart.h"
 #include "mpu6050.h"
 #include "oled_debug.h"
+#include "servo_control.h"
 
-#define MOTOR_DIAGNOSTIC_MODE   0
-#define ENCODER_DIAGNOSTIC_MODE 0
-#define MPU_DIAGNOSTIC_MODE     0
-#define MOTOR_TEST_SPEED      500
-#define ENCODER_TEST_SPEED    260
-#define SPEED_CLOSED_LOOP_ENABLE 0
+/* 速度闭环开关和单轮速度 PID 参数。
+ * Q10 表示真实增益 = 参数值 / 1024。速度环只做温和修正：
+ * SPEED_PID_MAX_OUTPUT 过大会和循迹转向抢控制权，导致小车摆头。
+ */
+#define SPEED_CLOSED_LOOP_ENABLE 1
 #define SPEED_TARGET_TICKS_PER_1000 30
-#define SPEED_PID_KP_Q10      180
+#define SPEED_PID_KP_Q10      90
 #define SPEED_PID_KI_Q10      0
-#define SPEED_PID_KD_Q10      20
-#define SPEED_PID_MAX_OUTPUT  80
+#define SPEED_PID_KD_Q10      0
+#define SPEED_PID_MAX_OUTPUT  25
+
+/* 板级电机校准参数。
+ * MOTOR_FORWARD_SIGN 用来修正电机正反方向。
+ * MOTOR_OUTPUT_SWAP 用来修正左右通道接反。
+ * 最小运行速度用于避免 PWM 太小时电机只响不动。
+ */
 #define MOTOR_FORWARD_SIGN    (-1)
 #define MOTOR_OUTPUT_SWAP     1
-#define MOTOR_MIN_RUN_SPEED   300
+#define MOTOR_MIN_RUN_SPEED   200
+#define MOTOR_MIN_RUN_SPEED_SLOW 180
+
+/* 按键消抖：按键必须连续按下这么多个控制周期，
+ * 才会被认为是一次有效按键事件。
+ */
 #define BUTTON_DEBOUNCE_TICKS 3U
-#define CROSS_STOP_TEST_ENABLE 1
-#define CROSS_STOP_FULL_BLACK_TICKS 2U
-#define BT_HEARTBEAT_TEST_ENABLE 0
+
+/* 2024 风格任务参数。TASK_TICKS_PER_CM 必须在真实场地上标定，
+ * 它会受到地面、电池电压、轮胎和编码器安装的影响。
+ */
 #define TASK2024_ENABLE       1
 #define TASK_TICKS_PER_CM     30L
-#define TASK1_TEST_CM         130
-#define TASK1_TEST_SPEED      380
+#define TASK1_LINE_CM         130
+#define TASK1_LINE_SPEED      380
 #define TASK_STRAIGHT_SPEED   300
 #define TASK_ARC_SPEED        230
 #define TASK_TURN_SPEED       190
@@ -50,10 +63,58 @@
 #define TASK_SEARCH_START_PERCENT 60L
 #define TASK_SEARCH_SWING_DEG_X100 1200L
 #define TASK_SEARCH_HALF_PERIOD_TICKS 35L
-#define H_TASK2_STOP_MASK     ((1U << 1) | (1U << 2) | (1U << 3))
-#define H_TASK2_STOP_TICKS    3U
+
+/* H 题停车线图案。
+ * 实际停车黑线大约只有 5 cm，所以不能死等五路全黑。
+ * 这里接受中心附近任意三个连续黑点，提高短线识别成功率。
+ */
+#define H_TASK2_STOP_LEFT3    ((1U << 0) | (1U << 1) | (1U << 2))
+#define H_TASK2_STOP_MID3     ((1U << 1) | (1U << 2) | (1U << 3))
+#define H_TASK2_STOP_RIGHT3   ((1U << 2) | (1U << 3) | (1U << 4))
+
+/* H 题末端慢速区。编码器估算距离到达这里后降低基础速度，
+ * 让 5 cm 短黑线更容易被稳定识别。
+ */
+#define H_TASK2_SLOW_START_CM 230L
+#define H_TASK2_SLOW_SPEED    220U
+#define H_TASK2_SLOW_SETTLE_TICKS 25U
+#define H_TASK2_STOP_TICKS    2U
 #define H_TASK2_RELEASE_TICKS 10U
 #define OLED_UPDATE_TICKS     10U
+
+/* 小球水管舵机基础参数。
+ *
+ * 这组参数是“水管姿态控制”的机械安全层，不是小球位置 PID 本身。
+ * 后面视觉识别到小球位置后，PID 只负责算出一个角度偏移量，再调用：
+ *   ServoControl_setOffsetDegX10(&ball_servo, pid_output_x10);
+ *
+ * 调试顺序建议：
+ *   1. 先只让舵机保持中位，调 BALL_SERVO_CENTER_ANGLE_X10 或
+ *      BALL_SERVO_CENTER_PULSE_US，让水管尽量水平。
+ *   2. 再确认方向：如果 PID 输出为正时水管倾斜方向反了，
+ *      不要先改 PID，先把 g_ball_servo_config.invert 改为 true。
+ *   3. 最后再调 PID 的 Kp/Kd。
+ *
+ * 角度单位是“度 * 10”：
+ *   600  = 60.0 度
+ *   900  = 90.0 度
+ *   1200 = 120.0 度
+ *
+ * 脉宽单位是 us：
+ *   1000us 通常接近一端
+ *   1500us 通常接近中位
+ *   2000us 通常接近另一端
+ *
+ * BALL_SERVO_MAX_STEP_US 是每 10ms 控制周期允许变化的最大脉宽。
+ * 它越大，舵机响应越快；它越小，水管动作越柔，但跟踪会更慢。
+ */
+#define BALL_SERVO_MIN_ANGLE_X10     600
+#define BALL_SERVO_CENTER_ANGLE_X10  900
+#define BALL_SERVO_MAX_ANGLE_X10     1200
+#define BALL_SERVO_MIN_PULSE_US      1000U
+#define BALL_SERVO_CENTER_PULSE_US   1500U
+#define BALL_SERVO_MAX_PULSE_US      2000U
+#define BALL_SERVO_MAX_STEP_US       20U
 
 volatile bool     g_ctrl_flag = false;
 volatile uint32_t g_sys_ticks = 0;
@@ -93,14 +154,88 @@ volatile uint16_t g_cross_count = 0;
 volatile bool     g_cross_latched = false;
 volatile bool     g_cross_event = false;
 volatile bool     g_cross_candidate = false;
-volatile bool     g_cross_stop_test_done = false;
-volatile uint8_t  g_cross_stop_black_ticks = 0;
 volatile uint32_t g_bt_rx_count = 0;
 volatile uint32_t g_bt_line_count = 0;
 volatile uint32_t g_bt_overflow_count = 0;
 volatile uint8_t  g_bt_last_cmd = BT_CMD_NONE;
 volatile bool     g_bt_line_event = false;
 volatile char     g_bt_last_line[BT_UART_LINE_SIZE] = {0};
+
+/* K230 视觉通信调试变量。
+ *
+ * K230 通过 UART1 把小球中心坐标发给 MSPM0。
+ * 这些变量不是 PID 参数，而是“通信层状态”，主要给 CCS 表达式窗口调试用。
+ *
+ * 变量含义：
+ *   g_k230_position_valid:
+ *     上电后是否至少收到过一帧正确坐标。收到过就是 true。
+ *
+ *   g_k230_position_fresh:
+ *     最近一小段时间内是否收到过新坐标。后续舵机 PID 应该优先看这个量。
+ *     如果它为 false，说明视觉坐标已经超时，舵机不要继续追旧坐标。
+ *
+ *   g_k230_frame_event:
+ *     当前控制周期内是否刚刚收到新的一帧。主循环更新调试量后会清掉它。
+ *
+ *   g_k230_center_x / g_k230_center_y:
+ *     最近一次成功解析出的视觉坐标。
+ *     水管控球时，可以根据相机安装方向选择其中一个作为小球位置反馈量。
+ *
+ *   g_k230_rx_count:
+ *     UART1 累计收到的原始字节数量。
+ *     如果它不增加，说明 MSPM0 的 PA9 没有收到 K230 发来的电平。
+ *
+ *   g_k230_frame_count:
+ *     成功解析出的完整坐标帧数量。
+ *     如果 rx_count 增加但 frame_count 不增加，说明字节到了，但协议格式不匹配。
+ *
+ *   g_k230_bad_frame_count:
+ *     帧头、帧尾不匹配，或者 UART 收到错误时累计加一。
+ *
+ *   g_k230_raw_last8:
+ *     最近 8 个原始字节，按真实接收顺序排列。
+ *     正常固定测试帧应该显示 170,170,1,2,3,4,255,255。
+ *     如果 CCS 表达式窗口不好展开数组，也可以直接看 g_k230_raw0~g_k230_raw7。
+ */
+volatile bool     g_k230_position_valid = false;
+volatile bool     g_k230_position_fresh = false;
+volatile bool     g_k230_frame_event = false;
+volatile uint16_t g_k230_center_x = 0;
+volatile uint16_t g_k230_center_y = 0;
+volatile uint32_t g_k230_rx_count = 0;
+volatile uint32_t g_k230_frame_count = 0;
+volatile uint32_t g_k230_bad_frame_count = 0;
+volatile uint32_t g_k230_last_frame_ticks = 0;
+volatile uint8_t  g_k230_last_byte = 0;
+volatile uint8_t  g_k230_parse_state = K230_PARSE_WAIT_HEAD1;
+volatile uint8_t  g_k230_raw_index = 0;
+volatile uint8_t  g_k230_raw_bytes[K230_UART_RAW_DEBUG_SIZE] = {0};
+volatile uint8_t  g_k230_raw_last8[K230_UART_RAW_DEBUG_SIZE] = {0};
+volatile uint8_t  g_k230_raw0 = 0;
+volatile uint8_t  g_k230_raw1 = 0;
+volatile uint8_t  g_k230_raw2 = 0;
+volatile uint8_t  g_k230_raw3 = 0;
+volatile uint8_t  g_k230_raw4 = 0;
+volatile uint8_t  g_k230_raw5 = 0;
+volatile uint8_t  g_k230_raw6 = 0;
+volatile uint8_t  g_k230_raw7 = 0;
+volatile uint8_t  g_k230_frame0 = 0;
+volatile uint8_t  g_k230_frame1 = 0;
+volatile uint8_t  g_k230_frame2 = 0;
+volatile uint8_t  g_k230_frame3 = 0;
+volatile uint8_t  g_k230_frame4 = 0;
+volatile uint8_t  g_k230_frame5 = 0;
+volatile uint8_t  g_k230_frame6 = 0;
+volatile uint8_t  g_k230_frame7 = 0;
+volatile uint8_t  g_k230_sync0 = 0;
+volatile uint8_t  g_k230_sync1 = 0;
+volatile uint8_t  g_k230_sync2 = 0;
+volatile uint8_t  g_k230_sync3 = 0;
+volatile uint8_t  g_k230_sync4 = 0;
+volatile uint8_t  g_k230_sync5 = 0;
+volatile uint8_t  g_k230_sync6 = 0;
+volatile uint8_t  g_k230_sync7 = 0;
+volatile uint8_t  g_k230_sync_count = 0;
 volatile bool     g_mpu_ok = false;
 volatile uint8_t  g_mpu_who_am_i = 0;
 volatile uint8_t  g_mpu_addr = 0;
@@ -143,20 +278,109 @@ volatile uint32_t g_h_task2_start_ticks = 0;
 volatile uint32_t g_h_task2_elapsed_ticks = 0;
 volatile uint8_t  g_h_task2_stop_ticks = 0;
 volatile uint8_t  g_h_task2_release_ticks = 0;
+volatile bool     g_h_task2_stop_armed = false;
+volatile int32_t  g_h_task2_travel_ticks = 0;
+volatile int32_t  g_h_task2_slow_start_ticks = 0;
+volatile bool     g_h_task2_finish_candidate = false;
+volatile bool     g_h_task2_slow_mode = false;
+volatile uint8_t  g_h_task2_slow_ticks = 0;
+volatile int16_t  g_ball_servo_angle_x10 = BALL_SERVO_CENTER_ANGLE_X10;
+volatile uint16_t g_ball_servo_pulse_us = BALL_SERVO_CENTER_PULSE_US;
 
-#if !MOTOR_DIAGNOSTIC_MODE
-static LineFollowConfig g_line_config = {
-    .base_speed      = 420,
-    .max_speed       = 700,
-    .kp_q10          = 110,
-    .ki_q10          = 0,
-    .kd_q10          = 145,
-    .lost_turn_speed = 260,
+static const ServoControlConfig g_ball_servo_config = {
+    .min_angle_x10    = BALL_SERVO_MIN_ANGLE_X10,
+    .center_angle_x10 = BALL_SERVO_CENTER_ANGLE_X10,
+    .max_angle_x10    = BALL_SERVO_MAX_ANGLE_X10,
+    .min_pulse_us     = BALL_SERVO_MIN_PULSE_US,
+    .center_pulse_us  = BALL_SERVO_CENTER_PULSE_US,
+    .max_pulse_us     = BALL_SERVO_MAX_PULSE_US,
+    .max_step_us      = BALL_SERVO_MAX_STEP_US,
+    .invert           = false,
 };
-#endif
+
+/* K230 接收状态必须放在全局区。
+ * UART1 中断负责第一时间把收到的字节塞进这个状态机；
+ * 主循环只负责读取它并更新 g_k230_* 调试变量。
+ */
+static volatile K230UART g_k230_uart_state;
+
+/* 主循迹参数。
+ * base_speed 是直线基础速度，max_speed 是双轮速度上限。
+ * Kp 决定转向力度，Kd 用来压住左右摆头。
+ * Ki 保持为 0，因为灰度循迹通常不希望长期积累转向误差。
+ */
+static LineFollowConfig g_line_config = {
+    .base_speed      = 380,
+    .max_speed       = 560,
+    .kp_q10          = 80,
+    .ki_q10          = 0,
+    .kd_q10          = 120,
+    .lost_turn_speed = 180,
+};
 
 static int16_t clamp_i16(int32_t value, int16_t min_value, int16_t max_value);
+static int32_t abs_i32(int32_t value);
 
+static uint8_t count_black_sensors5(uint8_t bits)
+{
+    uint8_t count = 0;
+
+    bits &= 0x1FU;
+    for (uint8_t bit = 0; bit < 5U; bit++) {
+        if ((bits & (1U << bit)) != 0U) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+/* 判断当前灰度图案是否像 H 题末端短停车线。
+ * 停车线很窄，如果强制要求 L1+C+R1 完全同时为黑，
+ * 车身一摆就会漏检。因此这里接受三路连续黑、中心加足够黑区、
+ * 或者任意四路黑。
+ */
+static bool h_task2_is_stop_line(uint8_t sensor_bits)
+{
+    uint8_t bits = sensor_bits & 0x1FU;
+
+    if (((bits & H_TASK2_STOP_LEFT3) == H_TASK2_STOP_LEFT3) ||
+        ((bits & H_TASK2_STOP_MID3) == H_TASK2_STOP_MID3) ||
+        ((bits & H_TASK2_STOP_RIGHT3) == H_TASK2_STOP_RIGHT3)) {
+        return true;
+    }
+
+    if (((bits & (1U << 2)) != 0U) && (count_black_sensors5(bits) >= 3U)) {
+        return true;
+    }
+
+    return count_black_sensors5(bits) >= 4U;
+}
+
+/* 使用左右轮绝对编码器距离的平均值。
+ * 这样在转弯或单侧轻微打滑时，比只相信某一侧更稳定。
+ */
+static int32_t h_task2_get_travel_ticks(void)
+{
+    return (abs_i32(g_encoder_left_total) + abs_i32(g_encoder_right_total)) / 2L;
+}
+
+/* 只重置 H 题停车线和慢速区状态。
+ * 通用循迹状态和速度 PID 状态由 reset_control_state() 统一重置。
+ */
+static void h_task2_reset_stop_state(void)
+{
+    g_h_task2_travel_ticks = 0;
+    g_h_task2_slow_start_ticks = H_TASK2_SLOW_START_CM * TASK_TICKS_PER_CM;
+    g_h_task2_finish_candidate = false;
+    g_h_task2_slow_mode = false;
+    g_h_task2_slow_ticks = 0;
+    g_h_task2_stop_ticks = 0;
+}
+
+/* 启动 H 题任务 2：先从起始黑线释放出来，
+ * 然后在设定行驶距离之后再开始寻找末端停车线。
+ */
 static void h_task2_start(void)
 {
     g_h_task2_active = true;
@@ -164,24 +388,34 @@ static void h_task2_start(void)
     g_h_task2_released = false;
     g_h_task2_start_ticks = g_sys_ticks;
     g_h_task2_elapsed_ticks = 0;
-    g_h_task2_stop_ticks = 0;
     g_h_task2_release_ticks = 0;
+    g_h_task2_stop_armed = false;
+    h_task2_reset_stop_state();
 }
 
+/* 停止 H 题任务 2，并记录耗时，供 OLED/调试显示使用。 */
 static void h_task2_stop(void)
 {
     g_h_task2_active = false;
     g_h_task2_done = true;
     g_h_task2_released = false;
     g_h_task2_elapsed_ticks = g_sys_ticks - g_h_task2_start_ticks;
-    g_h_task2_stop_ticks = 0;
     g_h_task2_release_ticks = 0;
     g_run_enabled = false;
 }
 
+/* 短停车线识别状态机：
+ *   1. 起步时先忽略初始黑线，直到小车完全离开它。
+ *   2. 到达慢速区距离前正常行驶。
+ *   3. 进入慢速区后降速，并等待几个周期让车身稳定。
+ *   4. 停车图案必须连续出现若干周期，才真正停车。
+ */
 static bool h_task2_should_stop(uint8_t sensor_bits)
 {
-    bool stop_line_seen = ((sensor_bits & H_TASK2_STOP_MASK) == H_TASK2_STOP_MASK);
+    bool stop_line_seen = h_task2_is_stop_line(sensor_bits);
+
+    g_h_task2_travel_ticks = h_task2_get_travel_ticks();
+    g_h_task2_slow_start_ticks = H_TASK2_SLOW_START_CM * TASK_TICKS_PER_CM;
 
     if (!g_h_task2_released) {
         if (!stop_line_seen) {
@@ -194,11 +428,32 @@ static bool h_task2_should_stop(uint8_t sensor_bits)
         } else {
             g_h_task2_release_ticks = 0;
         }
+        g_h_task2_stop_armed = false;
         g_h_task2_stop_ticks = 0;
+        g_h_task2_finish_candidate = false;
         return false;
     }
 
-    if (stop_line_seen) {
+    g_h_task2_stop_armed =
+        g_h_task2_travel_ticks >= g_h_task2_slow_start_ticks;
+
+    if (!g_h_task2_stop_armed) {
+        g_h_task2_slow_mode = false;
+        g_h_task2_slow_ticks = 0;
+        g_h_task2_stop_ticks = 0;
+        g_h_task2_finish_candidate = false;
+        return false;
+    }
+
+    g_h_task2_slow_mode = true;
+    if (g_h_task2_slow_ticks < H_TASK2_SLOW_SETTLE_TICKS) {
+        g_h_task2_slow_ticks++;
+    }
+
+    g_h_task2_finish_candidate =
+        (g_h_task2_slow_ticks >= H_TASK2_SLOW_SETTLE_TICKS) && stop_line_seen;
+
+    if (g_h_task2_finish_candidate) {
         if (g_h_task2_stop_ticks < H_TASK2_STOP_TICKS) {
             g_h_task2_stop_ticks++;
         }
@@ -233,7 +488,6 @@ static void update_gray_debug(uint8_t bits)
     g_gray_r2   = (bits & (1U << 4)) != 0U;
 }
 
-#if !MOTOR_DIAGNOSTIC_MODE
 static void update_line_debug(const LineFollowState *state)
 {
     update_gray_debug(state->raw_sensor_bits);
@@ -244,7 +498,6 @@ static void update_line_debug(const LineFollowState *state)
     g_line_left_speed   = state->left_speed;
     g_line_right_speed  = state->right_speed;
 }
-#endif
 
 static void update_bluetooth_debug(BluetoothUART *bt,
                                    const char *line,
@@ -267,6 +520,122 @@ static void update_bluetooth_debug(BluetoothUART *bt,
         g_bt_last_line[i] = '\0';
     }
 }
+
+/* 更新 K230 视觉坐标调试量。
+ * 这些 g_k230_* 变量主要给 CCS 表达式窗口、OLED 或蓝牙查询使用。
+ * position_valid 表示“至少收到过一帧正确坐标”；
+ * position_fresh 表示“最近 K230_UART_TIMEOUT_TICKS 内收到过坐标”，
+ * 后面小球 PID 应该优先看 fresh，避免视觉断流时舵机继续追旧坐标。
+ */
+static void update_k230_debug(volatile K230UART *k230)
+{
+    g_k230_position_valid = k230->position_valid;
+    g_k230_position_fresh = K230UART_isFresh(k230, g_sys_ticks);
+    g_k230_frame_event = K230UART_hasNewFrame(k230);
+    g_k230_center_x = k230->center_x;
+    g_k230_center_y = k230->center_y;
+    g_k230_rx_count = k230->rx_count;
+    g_k230_frame_count = k230->frame_count;
+    g_k230_bad_frame_count = k230->bad_frame_count;
+    g_k230_last_frame_ticks = k230->last_frame_tick;
+    g_k230_last_byte = k230->last_byte;
+    g_k230_parse_state = (uint8_t) k230->parse_state;
+    g_k230_raw_index = k230->raw_index;
+    for (uint8_t i = 0U; i < K230_UART_RAW_DEBUG_SIZE; i++) {
+        uint8_t ordered_index = (uint8_t) (k230->raw_index + i);
+        if (ordered_index >= K230_UART_RAW_DEBUG_SIZE) {
+            ordered_index = (uint8_t) (ordered_index - K230_UART_RAW_DEBUG_SIZE);
+        }
+
+        g_k230_raw_bytes[i] = k230->raw_bytes[i];
+        g_k230_raw_last8[i] = k230->raw_bytes[ordered_index];
+    }
+    g_k230_raw0 = g_k230_raw_last8[0];
+    g_k230_raw1 = g_k230_raw_last8[1];
+    g_k230_raw2 = g_k230_raw_last8[2];
+    g_k230_raw3 = g_k230_raw_last8[3];
+    g_k230_raw4 = g_k230_raw_last8[4];
+    g_k230_raw5 = g_k230_raw_last8[5];
+    g_k230_raw6 = g_k230_raw_last8[6];
+    g_k230_raw7 = g_k230_raw_last8[7];
+    g_k230_frame0 = k230->last_frame[0];
+    g_k230_frame1 = k230->last_frame[1];
+    g_k230_frame2 = k230->last_frame[2];
+    g_k230_frame3 = k230->last_frame[3];
+    g_k230_frame4 = k230->last_frame[4];
+    g_k230_frame5 = k230->last_frame[5];
+    g_k230_frame6 = k230->last_frame[6];
+    g_k230_frame7 = k230->last_frame[7];
+    g_k230_sync0 = k230->sync_window[0];
+    g_k230_sync1 = k230->sync_window[1];
+    g_k230_sync2 = k230->sync_window[2];
+    g_k230_sync3 = k230->sync_window[3];
+    g_k230_sync4 = k230->sync_window[4];
+    g_k230_sync5 = k230->sync_window[5];
+    g_k230_sync6 = k230->sync_window[6];
+    g_k230_sync7 = k230->sync_window[7];
+    g_k230_sync_count = k230->sync_count;
+
+    K230UART_clearNewFrame(k230);
+}
+
+/* 开启 K230 串口接收中断。
+ * 之前只靠主循环每 10ms 轮询一次，115200 波特率下一帧 8 字节不到 1ms 就发完，
+ * UART FIFO 来不及保存整帧，所以你会看到每发一次只收到最后的 0xFF。
+ */
+static void k230_uart_enable_rx_interrupt(void)
+{
+#if K230_UART_ENABLE
+#ifndef K230_UART_INST
+#error "K230_UART_ENABLE is 1, but K230_UART_INST is not defined."
+#endif
+#ifndef K230_INST_INT_IRQN
+#error "K230 UART IRQ number is not defined. Check SysConfig instance name."
+#endif
+    DL_UART_Main_enableInterrupt(K230_UART_INST,
+        DL_UART_MAIN_INTERRUPT_RX |
+        DL_UART_MAIN_INTERRUPT_RX_TIMEOUT_ERROR |
+        DL_UART_MAIN_INTERRUPT_OVERRUN_ERROR |
+        DL_UART_MAIN_INTERRUPT_FRAMING_ERROR |
+        DL_UART_MAIN_INTERRUPT_NOISE_ERROR);
+
+    NVIC_ClearPendingIRQ(K230_INST_INT_IRQN);
+    NVIC_EnableIRQ(K230_INST_INT_IRQN);
+#endif
+}
+
+/* K230 UART1 接收中断。
+ * 尽量只做“读字节 + 推状态机”这件事，避免中断里执行复杂控制逻辑。
+ */
+void UART1_IRQHandler(void)
+{
+#if K230_UART_ENABLE
+    switch (DL_UART_Main_getPendingInterrupt(K230_UART_INST)) {
+    case DL_UART_MAIN_IIDX_RX:
+    case DL_UART_MAIN_IIDX_RX_TIMEOUT_ERROR:
+        while (!DL_UART_Main_isRXFIFOEmpty(K230_UART_INST)) {
+            uint8_t byte = DL_UART_Main_receiveData(K230_UART_INST);
+            K230UART_pushByte(&g_k230_uart_state, byte, g_sys_ticks);
+        }
+        break;
+
+    case DL_UART_MAIN_IIDX_OVERRUN_ERROR:
+    case DL_UART_MAIN_IIDX_FRAMING_ERROR:
+    case DL_UART_MAIN_IIDX_NOISE_ERROR:
+        g_k230_uart_state.bad_frame_count++;
+        K230UART_resetParser(&g_k230_uart_state);
+        while (!DL_UART_Main_isRXFIFOEmpty(K230_UART_INST)) {
+            uint8_t byte = DL_UART_Main_receiveData(K230_UART_INST);
+            K230UART_pushByte(&g_k230_uart_state, byte, g_sys_ticks);
+        }
+        break;
+
+    default:
+        break;
+    }
+#endif
+}
+
 static void set_motor_debug(int16_t left, int16_t right)
 {
 #if MOTOR_OUTPUT_SWAP
@@ -282,6 +651,7 @@ static void set_motor_debug(int16_t left, int16_t right)
     Board_setMotorSpeed(motor_left, motor_right);
 }
 
+#if !TASK2024_ENABLE
 static bool button_pressed_event(void)
 {
     static bool last_raw = false;
@@ -310,6 +680,7 @@ static bool button_pressed_event(void)
 
     return false;
 }
+#endif
 
 #if TASK2024_ENABLE
 typedef enum {
@@ -345,7 +716,7 @@ typedef struct {
 } Task2024State;
 
 static const Task2024Action g_task1_actions[] = {
-    {TASK_ACTION_STRAIGHT_TO_LINE, TASK1_TEST_CM, TASK1_TEST_SPEED, true},
+    {TASK_ACTION_STRAIGHT_TO_LINE, TASK1_LINE_CM, TASK1_LINE_SPEED, true},
     {TASK_ACTION_STOP, 0, 0, false},
 };
 
@@ -631,7 +1002,7 @@ static void imu_update_heading(void)
     g_mpu_gyro_z_mdps = scaled.gyro_z_mdps;
     corrected_z = scaled.gyro_z_mdps - g_mpu_gyro_z_bias_mdps;
 
-    /* Loop period is 10 ms. mdps * 10ms / 10000 = degrees * 100. */
+    /* 控制周期是 10 ms。mdps * 10ms / 10000 = 角度 * 100。 */
     g_mpu_yaw_deg_x100 += corrected_z / 1000L;
 }
 
@@ -783,20 +1154,35 @@ static int16_t speed_to_target_ticks(int16_t speed)
     return (int16_t) (((int32_t) speed * SPEED_TARGET_TICKS_PER_1000) / 1000);
 }
 
+/* 把每个控制周期的编码器 tick 换算成近似 cm/s，用于调试显示。
+ * 它共用 TASK_TICKS_PER_CM，所以重新标定距离后这个显示也会更准。
+ */
+static int16_t speed_ticks_to_cms(int16_t ticks_per_loop)
+{
+    return (int16_t) (((int32_t) ticks_per_loop * 100L) / TASK_TICKS_PER_CM);
+}
+
+/* 在 PID 修正后套用最小运行 PWM。
+ * 低于这个值时电机可能只响不动，会破坏编码器反馈和直线校准。
+ */
 static int16_t apply_motor_min_run_speed(int16_t speed)
 {
+    int16_t min_run_speed = g_h_task2_slow_mode ?
+        MOTOR_MIN_RUN_SPEED_SLOW : MOTOR_MIN_RUN_SPEED;
+
     if (speed == 0) {
         return 0;
     }
-    if ((speed > 0) && (speed < MOTOR_MIN_RUN_SPEED)) {
-        return MOTOR_MIN_RUN_SPEED;
+    if ((speed > 0) && (speed < min_run_speed)) {
+        return min_run_speed;
     }
-    if ((speed < 0) && (speed > -MOTOR_MIN_RUN_SPEED)) {
-        return -MOTOR_MIN_RUN_SPEED;
+    if ((speed < 0) && (speed > -min_run_speed)) {
+        return -min_run_speed;
     }
     return speed;
 }
 
+/* 清空 OLED 和蓝牙状态里显示的编码器/速度调试量。 */
 static void reset_speed_debug(void)
 {
     g_encoder_left_delta = 0;
@@ -813,13 +1199,15 @@ static void reset_speed_debug(void)
     g_speed_right_pwm = 0;
 }
 
+/* 在 GO、STOP 或任务切换前，把所有控制器恢复到确定状态。
+ * 这样旧的 PID 积分、横线锁存和编码器累计值不会影响下一次运行。
+ */
 static void reset_control_state(LineFollowState *line_state,
                                 TrackFSM *track_fsm,
                                 CrossDetector *cross_detector,
                                 SpeedPID *left_speed_pid,
                                 SpeedPID *right_speed_pid,
-                                uint16_t *current_base_speed,
-                                uint8_t *cross_stop_black_ticks)
+                                uint16_t *current_base_speed)
 {
     set_motor_debug(0, 0);
     LineFollow_init(line_state);
@@ -836,8 +1224,6 @@ static void reset_control_state(LineFollowState *line_state,
     g_cross_latched = false;
     g_cross_event = false;
     g_cross_candidate = false;
-    g_cross_stop_black_ticks = 0;
-    *cross_stop_black_ticks = 0;
 }
 
 static void bluetooth_send_uint32(uint32_t value)
@@ -874,8 +1260,6 @@ static void bluetooth_send_status(void)
     bluetooth_send_uint32(g_cross_count);
     BluetoothUART_sendString(" LOST=");
     BluetoothUART_sendChar(g_line_seen ? '0' : '1');
-    BluetoothUART_sendString(" STOP=");
-    BluetoothUART_sendChar(g_cross_stop_test_done ? '1' : '0');
     BluetoothUART_sendString(" MPU=");
     BluetoothUART_sendChar(g_mpu_ok ? '1' : '0');
     BluetoothUART_sendString(" ADDR=");
@@ -895,21 +1279,13 @@ static void bluetooth_send_status(void)
     bluetooth_send_uint32(g_task2024_step);
     BluetoothUART_sendString(" SEARCH=");
     BluetoothUART_sendChar(g_task2024_search_active ? '1' : '0');
+    BluetoothUART_sendString(" K230=");
+    BluetoothUART_sendChar(g_k230_position_fresh ? '1' : '0');
+    BluetoothUART_sendString(" KX=");
+    bluetooth_send_uint32(g_k230_center_x);
+    BluetoothUART_sendString(" KY=");
+    bluetooth_send_uint32(g_k230_center_y);
     BluetoothUART_sendLine("");
-}
-
-static void bluetooth_send_heartbeat_if_needed(void)
-{
-#if BT_HEARTBEAT_TEST_ENABLE
-    static uint32_t last_heartbeat_ticks = 0;
-
-    if (!g_run_enabled && ((g_sys_ticks - last_heartbeat_ticks) >= 100U)) {
-        last_heartbeat_ticks = g_sys_ticks;
-        BluetoothUART_sendString("BT TICK ");
-        bluetooth_send_uint32(g_sys_ticks);
-        BluetoothUART_sendLine("");
-    }
-#endif
 }
 
 static void handle_bluetooth_command(BluetoothCommand cmd,
@@ -919,16 +1295,14 @@ static void handle_bluetooth_command(BluetoothCommand cmd,
                                      SpeedPID *left_speed_pid,
                                      SpeedPID *right_speed_pid,
                                      RunIndicator *run_indicator,
-                                     uint16_t *current_base_speed,
-                                     uint8_t *cross_stop_black_ticks)
+                                     uint16_t *current_base_speed)
 {
     switch (cmd) {
     case BT_CMD_GO:
         reset_control_state(line_state, track_fsm, cross_detector,
                             left_speed_pid, right_speed_pid,
-                            current_base_speed, cross_stop_black_ticks);
+                            current_base_speed);
         g_run_enabled = true;
-        g_cross_stop_test_done = false;
         RunIndicator_onStart(run_indicator);
         BluetoothUART_sendLine("OK GO");
         break;
@@ -937,7 +1311,7 @@ static void handle_bluetooth_command(BluetoothCommand cmd,
         g_run_enabled = false;
         reset_control_state(line_state, track_fsm, cross_detector,
                             left_speed_pid, right_speed_pid,
-                            current_base_speed, cross_stop_black_ticks);
+                            current_base_speed);
         RunIndicator_onStop(run_indicator);
         BluetoothUART_sendLine("OK STOP");
         break;
@@ -974,17 +1348,26 @@ static void set_motor_speed_closed_loop(SpeedPID *left_pid, SpeedPID *right_pid,
     int16_t left_pwm = left_target;
     int16_t right_pwm = right_target;
 
+    /* 先读取并累计编码器增量。
+     * 循迹、H 题距离、OLED 和速度 PID 都使用同一份最新测量值。
+     */
     g_encoder_left_delta = Encoder_getLeftTicks();
     g_encoder_right_delta = Encoder_getRightTicks();
     g_encoder_left_total += g_encoder_left_delta;
     g_encoder_right_total += g_encoder_right_delta;
 
+    /* 把逻辑 PWM 目标换算成编码器 tick 目标。
+     * 换算故意保持简单，方便直接在赛道上调 SPEED_TARGET_TICKS_PER_1000。
+     */
     g_speed_left_actual_ticks = clamp_i16(g_encoder_left_delta, -32768, 32767);
     g_speed_right_actual_ticks = clamp_i16(g_encoder_right_delta, -32768, 32767);
     g_speed_left_target_ticks = speed_to_target_ticks(left_target);
     g_speed_right_target_ticks = speed_to_target_ticks(right_target);
 
 #if SPEED_CLOSED_LOOP_ENABLE
+    /* 只要某个轮子的目标速度为 0，就重置该轮 PID。
+     * 否则历史积分会在下一次起步时突然给车一个冲击。
+     */
     if (left_target == 0) {
         SpeedPID_reset(left_pid);
         g_speed_left_correction = 0;
@@ -1008,139 +1391,24 @@ static void set_motor_speed_closed_loop(SpeedPID *left_pid, SpeedPID *right_pid,
     }
 #else
     g_speed_left_correction = 0;
-    g_speed_right_correction = 0;
+        g_speed_right_correction = 0;
 #endif
 
+    /* 最小 PWM 放在最后处理。
+     * 这样 PID 仍围绕原始逻辑目标计算，而实际电机又能拿到足够启动的 PWM。
+     */
     left_pwm = apply_motor_min_run_speed(left_pwm);
     right_pwm = apply_motor_min_run_speed(right_pwm);
     g_speed_left_pwm = left_pwm;
     g_speed_right_pwm = right_pwm;
     set_motor_debug(left_pwm, right_pwm);
 }
-static void run_encoder_diagnostic(void)
-{
-    Encoder_init();
-    Encoder_clearDeltas();
-    set_motor_debug(0, 0);
-
-    while (1) {
-        __WFI();
-        if (!g_ctrl_flag) {
-            continue;
-        }
-        g_ctrl_flag = false;
-
-
-        if (button_pressed_event()) {
-            g_run_enabled = !g_run_enabled;
-            Encoder_clearDeltas();
-            g_encoder_left_delta = 0;
-            g_encoder_right_delta = 0;
-            g_encoder_left_total = 0;
-            g_encoder_right_total = 0;
-        }
-
-        g_encoder_left_delta = Encoder_getLeftTicks();
-        g_encoder_right_delta = Encoder_getRightTicks();
-        g_encoder_left_total += g_encoder_left_delta;
-        g_encoder_right_total += g_encoder_right_delta;
-
-        if (g_run_enabled) {
-            set_motor_debug(ENCODER_TEST_SPEED, ENCODER_TEST_SPEED);
-        } else {
-            set_motor_debug(0, 0);
-        }
-    }
-}
-static void run_motor_diagnostic(void)
-{
-    while (1) {
-        update_gray_debug(Board_readGray5());
-        set_motor_debug(MOTOR_TEST_SPEED, MOTOR_TEST_SPEED);
-        Board_delayMs(100);
-    }
-}
-
-static void run_mpu_diagnostic(void)
-{
-    LineFollowState line_state;
-    MPU6050RawData raw;
-    bool imu_ok;
-    uint8_t who_am_i = 0;
-    uint8_t imu_sample_divider = 0;
-
-    SysTick->CTRL = 0U;
-    g_ctrl_flag = false;
-    LineFollow_init(&line_state);
-    set_motor_debug(0, 0);
-    g_mpu_addr = MPU6050_I2C_ADDR_AD0_LOW;
-    g_mpu_init_attempts++;
-    (void) MPU6050_readWhoAmI(&who_am_i);
-    g_mpu_who_am_i = who_am_i;
-    g_mpu6050_who_am_i = who_am_i;
-
-    imu_ok = MPU6050_init();
-    g_mpu_init_ok_once = imu_ok;
-    g_mpu_ok = imu_ok;
-    g_imu_ok = g_mpu_ok;
-    if (!imu_ok) {
-        Board_setBuzzer(true);
-    }
-
-    while (1) {
-        uint8_t sensor_bits = Board_readGray5();
-
-        if (imu_ok) {
-            imu_sample_divider++;
-            if (imu_sample_divider >= 10U) {
-                imu_sample_divider = 0U;
-                imu_ok = MPU6050_readRaw(&raw);
-                g_mpu_raw_read_ok = imu_ok;
-                g_mpu_ok = imu_ok;
-                g_imu_ok = imu_ok;
-
-                if (imu_ok) {
-                    g_mpu_read_ok_count++;
-                    g_imu_read_count++;
-                    g_mpu_accel_x = raw.accel_x;
-                    g_mpu_accel_y = raw.accel_y;
-                    g_mpu_accel_z = raw.accel_z;
-                    g_mpu_gyro_x = raw.gyro_x;
-                    g_mpu_gyro_y = raw.gyro_y;
-                    g_mpu_gyro_z = raw.gyro_z;
-                    g_imu_accel_x = raw.accel_x;
-                    g_imu_accel_y = raw.accel_y;
-                    g_imu_accel_z = raw.accel_z;
-                    g_imu_gyro_x = raw.gyro_x;
-                    g_imu_gyro_y = raw.gyro_y;
-                    g_imu_gyro_z = raw.gyro_z;
-                } else {
-                    g_mpu_read_fail_count++;
-                    g_imu_read_fail_count++;
-                }
-            }
-        }
-
-        LineFollow_update(&line_state, &g_line_config, sensor_bits, g_line_config.base_speed);
-        update_gray_debug(sensor_bits);
-        set_motor_debug(0, 0);
-        Board_delayMs(1);
-    }
-}
-
 int main(void)
 {
     Board_init();
     OLED_Debug_init();
-    OLED_Debug_update(0U, false, 0U);
+    OLED_Debug_update(0U, false, 0U, 0, 0, false);
 
-#if MPU_DIAGNOSTIC_MODE
-    run_mpu_diagnostic();
-#elif ENCODER_DIAGNOSTIC_MODE
-    run_encoder_diagnostic();
-#elif MOTOR_DIAGNOSTIC_MODE
-    run_motor_diagnostic();
-#else
     LineFollowState line_state;
     TrackFSM track_fsm;
     SpeedPID left_speed_pid;
@@ -1148,12 +1416,12 @@ int main(void)
     CrossDetector cross_detector;
     RunIndicator run_indicator;
     BluetoothUART bt_uart;
+    ServoControl ball_servo;
 #if TASK2024_ENABLE
     Task2024State task2024;
 #endif
     char bt_line[BT_UART_LINE_SIZE];
     uint16_t current_base_speed;
-    uint8_t cross_stop_black_ticks = 0;
 
     LineFollow_init(&line_state);
     TrackFSM_init(&track_fsm);
@@ -1166,6 +1434,11 @@ int main(void)
     CrossDetector_init(&cross_detector);
     RunIndicator_init(&run_indicator);
     BluetoothUART_init(&bt_uart);
+    K230UART_init(&g_k230_uart_state);
+    k230_uart_enable_rx_interrupt();
+    ServoControl_init(&ball_servo, &g_ball_servo_config);
+    g_ball_servo_angle_x10 = ServoControl_getCurrentAngleDegX10(&ball_servo);
+    g_ball_servo_pulse_us = ServoControl_getCurrentPulseUs(&ball_servo);
 #if TASK2024_ENABLE
     Task2024_reset(&task2024);
     imu_init_debug();
@@ -1184,8 +1457,10 @@ int main(void)
         g_ctrl_flag = false;
 
         BluetoothUART_poll(&bt_uart);
+        K230UART_poll(&g_k230_uart_state, g_sys_ticks);
+        update_k230_debug(&g_k230_uart_state);
 #if TASK2024_ENABLE
-        if (task2024.active) {
+        if (task2024.active || g_h_task2_active) {
             imu_update_heading();
         }
 #endif
@@ -1195,19 +1470,25 @@ int main(void)
             handle_bluetooth_command(bt_cmd, &line_state, &track_fsm,
                                      &cross_detector, &left_speed_pid,
                                      &right_speed_pid, &run_indicator,
-                                     &current_base_speed,
-                                     &cross_stop_black_ticks);
+                                     &current_base_speed);
         } else {
             update_bluetooth_debug(&bt_uart, bt_line, BluetoothUART_getCommand(&bt_uart), false);
         }
-        bluetooth_send_heartbeat_if_needed();
+
+        /* 舵机控制先独立刷新。
+         * 现在目标默认保持中位；后面接视觉 PID 时，只需要在这里之前
+         * 根据小球位置调用 ServoControl_setOffsetDegX10()。
+         */
+        ServoControl_update(&ball_servo);
+        g_ball_servo_angle_x10 = ServoControl_getCurrentAngleDegX10(&ball_servo);
+        g_ball_servo_pulse_us = ServoControl_getCurrentPulseUs(&ball_servo);
 
 #if TASK2024_ENABLE
         for (uint8_t key_id = 1U; key_id <= 4U; key_id++) {
             if (task_key_pressed_event(key_id)) {
                 reset_control_state(&line_state, &track_fsm, &cross_detector,
                                     &left_speed_pid, &right_speed_pid,
-                                    &current_base_speed, &cross_stop_black_ticks);
+                                    &current_base_speed);
                 if (key_id == 2U) {
                     Task2024_reset(&task2024);
                     h_task2_start();
@@ -1216,7 +1497,6 @@ int main(void)
                     Task2024_start(&task2024, key_id);
                 }
                 g_run_enabled = true;
-                g_cross_stop_test_done = false;
                 RunIndicator_onStart(&run_indicator);
                 break;
             }
@@ -1226,10 +1506,9 @@ int main(void)
             g_run_enabled = !g_run_enabled;
             reset_control_state(&line_state, &track_fsm, &cross_detector,
                                 &left_speed_pid, &right_speed_pid,
-                                &current_base_speed, &cross_stop_black_ticks);
+                                &current_base_speed);
 
             if (g_run_enabled) {
-                g_cross_stop_test_done = false;
                 RunIndicator_onStart(&run_indicator);
             } else {
                 RunIndicator_onStop(&run_indicator);
@@ -1253,36 +1532,6 @@ int main(void)
         g_track_state = (uint8_t) track_fsm.state;
         g_fsm_base_speed = current_base_speed;
 
-#if CROSS_STOP_TEST_ENABLE
-        if (g_run_enabled
-#if TASK2024_ENABLE
-            && !task2024.active
-            && !g_h_task2_active
-#endif
-            && ((sensor_bits & 0x1FU) == 0x1FU)) {
-            if (cross_stop_black_ticks < CROSS_STOP_FULL_BLACK_TICKS) {
-                cross_stop_black_ticks++;
-            }
-        } else {
-            cross_stop_black_ticks = 0;
-        }
-        g_cross_stop_black_ticks = cross_stop_black_ticks;
-
-        if (g_run_enabled && (cross_stop_black_ticks >= CROSS_STOP_FULL_BLACK_TICKS)) {
-            g_run_enabled = false;
-            g_cross_stop_test_done = true;
-            cross_stop_black_ticks = 0;
-            g_cross_stop_black_ticks = 0;
-            set_motor_debug(0, 0);
-            SpeedPID_reset(&left_speed_pid);
-            SpeedPID_reset(&right_speed_pid);
-            reset_speed_debug();
-            RunIndicator_onStop(&run_indicator);
-            RunIndicator_update(&run_indicator, false);
-            continue;
-        }
-#endif
-
         if (!g_run_enabled) {
 #if TASK2024_ENABLE
             Task2024_reset(&task2024);
@@ -1292,7 +1541,8 @@ int main(void)
             set_motor_debug(0, 0);
             RunIndicator_update(&run_indicator, false);
             if ((g_sys_ticks % OLED_UPDATE_TICKS) == 0U) {
-                OLED_Debug_update(h_task2_display_ticks(), false, sensor_bits);
+                OLED_Debug_update(h_task2_display_ticks(), false, sensor_bits,
+                                  0, 0, g_h_task2_slow_mode);
             }
             continue;
         }
@@ -1306,7 +1556,8 @@ int main(void)
             reset_speed_debug();
             RunIndicator_onStop(&run_indicator);
             RunIndicator_update(&run_indicator, false);
-            OLED_Debug_update(h_task2_display_ticks(), false, sensor_bits);
+            OLED_Debug_update(h_task2_display_ticks(), false, sensor_bits,
+                              0, 0, g_h_task2_slow_mode);
             continue;
         }
 #endif
@@ -1322,17 +1573,43 @@ int main(void)
                                             task_left_speed,
                                             task_right_speed);
                 RunIndicator_update(&run_indicator, g_run_enabled);
+                if ((g_sys_ticks % OLED_UPDATE_TICKS) == 0U) {
+                    OLED_Debug_update(h_task2_display_ticks(), true, sensor_bits,
+                                      speed_ticks_to_cms(g_speed_left_actual_ticks),
+                                      speed_ticks_to_cms(g_speed_right_actual_ticks),
+                                      g_h_task2_slow_mode);
+                }
                 continue;
             }
         }
 #endif
 
-        set_motor_speed_closed_loop(&left_speed_pid, &right_speed_pid,
-                                    line_state.left_speed,
-                                    line_state.right_speed);
-        RunIndicator_update(&run_indicator, true);
-    }
+        {
+            int16_t output_left_speed = line_state.left_speed;
+            int16_t output_right_speed = line_state.right_speed;
+
+#if TASK2024_ENABLE
+            if (g_h_task2_active && g_h_task2_slow_mode) {
+                LineFollow_update(&line_state, &g_line_config,
+                                  sensor_bits, H_TASK2_SLOW_SPEED);
+                update_line_debug(&line_state);
+                output_left_speed = line_state.left_speed;
+                output_right_speed = line_state.right_speed;
+            }
 #endif
+
+            set_motor_speed_closed_loop(&left_speed_pid, &right_speed_pid,
+                                        output_left_speed,
+                                        output_right_speed);
+        }
+        RunIndicator_update(&run_indicator, true);
+        if ((g_sys_ticks % OLED_UPDATE_TICKS) == 0U) {
+            OLED_Debug_update(h_task2_display_ticks(), true, sensor_bits,
+                              speed_ticks_to_cms(g_speed_left_actual_ticks),
+                              speed_ticks_to_cms(g_speed_right_actual_ticks),
+                              g_h_task2_slow_mode);
+        }
+    }
 }
 
 

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>GRAY_PWM：五路灰度循迹小车</title>
+  <style>body{font-family:Arial,"Microsoft YaHei",sans-serif;line-height:1.6;max-width:980px;margin:32px auto;padding:0 20px;color:#1f2933}code{background:#f2f4f7;padding:2px 5px;border-radius:4px}li{margin:6px 0}table{border-collapse:collapse}td,th{border:1px solid #d8dee9;padding:6px 10px}</style>
+</head>
+<body>
+  <h1>GRAY_PWM：五路灰度循迹小车</h1>
+  <p>本工程面向电赛小车快速验证：MSPM0G3507 + 五路数字灰度 + TB6612 差速驱动。</p>
+  <h2>先看当前状态</h2>
+  <ul>
+    <li><code>main.c</code> 默认 <code>MOTOR_DIAGNOSTIC_MODE = 1</code>，下载后只做电机正反转诊断，不会循迹。</li>
+    <li>要跑循迹，把 <code>MOTOR_DIAGNOSTIC_MODE</code> 改成 <code>0</code> 后重新编译下载。</li>
+    <li>控制周期当前为 100 Hz，即 10 ms 一次。</li>
+    <li>编码器、速度 PID、赛道状态机、MPU6050 已有模块，但默认主循环尚未接入。</li>
+  </ul>
+  <h2>关键核对</h2>
+  <table>
+    <tr><th>项目</th><th>默认设置</th></tr>
+    <tr><td>灰度</td><td>A26/A27/A24/A25/B24，对应 L2/L1/C/R1/R2</td></tr>
+    <tr><td>PWM</td><td>A12 = TIMG0_C0，A13 = TIMG0_C1，period/load = 1000</td></tr>
+    <tr><td>电机</td><td>A 通道左电机，B 通道右电机</td></tr>
+    <tr><td>黑线电平</td><td><code>GRAY_BLACK_IS_LOW = 1</code></td></tr>
+  </table>
+  <p>完整说明见同目录 <code>README.md</code>；引脚表见 <code>TIANMENG_IO_MAPPING.md</code>。</p>
+</body>
+</html>

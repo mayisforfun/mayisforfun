@@ -259,9 +259,56 @@ static void OLED_Debug_init(void)
     OLED_Debug_clear();
 }
 
-static void OLED_Debug_update(uint32_t elapsed_ticks, bool running, uint8_t gray_bits)
+static void OLED_Debug_formatSigned3(char *out, int16_t value)
+{
+    uint16_t mag;
+
+    if (value < 0) {
+        out[0] = '-';
+        mag = (uint16_t) (-value);
+    } else {
+        out[0] = ' ';
+        mag = (uint16_t) value;
+    }
+
+    if (mag > 999U) {
+        mag = 999U;
+    }
+
+    out[1] = (char) ('0' + ((mag / 100U) % 10U));
+    out[2] = (char) ('0' + ((mag / 10U) % 10U));
+    out[3] = (char) ('0' + (mag % 10U));
+}
+
+static void OLED_Debug_formatSpeed(char *out, int16_t left_cms, int16_t right_cms)
+{
+    out[0] = 'V';
+    out[1] = 'L';
+    OLED_Debug_formatSigned3(&out[2], left_cms);
+    out[6] = 'R';
+    OLED_Debug_formatSigned3(&out[7], right_cms);
+    out[11] = '\0';
+}
+
+static void OLED_Debug_update(uint32_t elapsed_ticks,
+                              bool running,
+                              uint8_t gray_bits,
+                              int16_t left_cms,
+                              int16_t right_cms,
+                              bool slow_mode)
 {
     char line[12];
+    char state[12] = {
+        running ? 'R' : 'S',
+        running ? 'U' : 'T',
+        running ? 'N' : 'O',
+        running ? ' ' : 'P',
+        ' ',
+        'S','L','O','W',
+        slow_mode ? '1' : '0',
+        '\0','\0'
+    };
+    char speed[12];
     char gray[12] = {
         'G','R','A','Y',' ',
         (gray_bits & (1U << 0)) ? '1' : '0',
@@ -273,9 +320,11 @@ static void OLED_Debug_update(uint32_t elapsed_ticks, bool running, uint8_t gray
     };
 
     OLED_Debug_formatTime(line, elapsed_ticks);
+    OLED_Debug_formatSpeed(speed, left_cms, right_cms);
     OLED_Debug_showString(0U, 0U, line);
-    OLED_Debug_showString(0U, 2U, running ? "RUN " : "STOP");
+    OLED_Debug_showString(0U, 2U, state);
     OLED_Debug_showString(0U, 4U, gray);
+    OLED_Debug_showString(0U, 6U, speed);
 }
 
 #endif

@@ -177,9 +177,56 @@
 #endif
 #endif
 
+/* 舵机 PWM 板级开关。
+ *
+ * 当前工程的 PWM_0 已经给左右电机使用，舵机必须使用另一个 50Hz PWM。
+ * 原因是电机 PWM 通常是高频短周期，而舵机需要固定 20ms 周期：
+ *   周期 20ms，约 50Hz
+ *   高电平 1000us 左右 -> 一端
+ *   高电平 1500us 左右 -> 中位
+ *   高电平 2000us 左右 -> 另一端
+ *
+ * 不能把舵机直接挂在左右电机 PWM 上，否则舵机读到的不是标准舵机信号。
+ *
+ * 在 SysConfig 里新增舵机 PWM 后，再把 SERVO_PWM_ENABLE 置 1，并在工程
+ * 或本文件中定义下面这些宏：
+ *   SERVO_PWM_INST              舵机定时器实例
+ *   SERVO_PWM_CC_INDEX          舵机 PWM 比较通道
+ *   SERVO_PWM_TIMER_CLK_HZ      舵机定时器计数频率
+ *   SERVO_PWM_PERIOD_COUNTS     20ms 周期对应的计数值
+ *
+ * 推荐配置：
+ *   让舵机定时器计数频率为 1MHz，这样 1 个计数 = 1us。
+ *   此时 SERVO_PWM_PERIOD_COUNTS = 20000，计算最直观。
+ *
+ * 当前默认 SERVO_PWM_ENABLE=0，是为了在没配舵机硬件前也能正常编译。
+ * 这时 ServoControl_update() 会正常运行，但 Board_setServoPulseUs() 不会
+ * 真正输出 PWM。
+ */
+#ifndef SERVO_PWM_ENABLE
+#define SERVO_PWM_ENABLE 0
+#endif
+
+#ifndef SERVO_PWM_TIMER_CLK_HZ
+#define SERVO_PWM_TIMER_CLK_HZ 1000000U
+#endif
+
+#ifndef SERVO_PWM_PERIOD_COUNTS
+#define SERVO_PWM_PERIOD_COUNTS 20000U
+#endif
+
+#ifndef SERVO_PWM_CENTER_PULSE_US
+#define SERVO_PWM_CENTER_PULSE_US 1500U
+#endif
+
+#ifndef SERVO_PWM_COMPARE_IS_INVERTED
+#define SERVO_PWM_COMPARE_IS_INVERTED 0
+#endif
+
 void Board_init(void);
 uint8_t Board_readGray5(void);
 void Board_setMotorSpeed(int16_t left_speed, int16_t right_speed);
+void Board_setServoPulseUs(uint16_t pulse_us);
 bool Board_readStartButton(void);
 bool Board_readTaskKey(uint8_t key_id);
 void Board_setBuzzer(bool on);
