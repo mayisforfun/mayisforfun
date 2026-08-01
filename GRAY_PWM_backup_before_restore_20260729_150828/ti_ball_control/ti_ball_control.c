@@ -12,28 +12,43 @@ static float clamp_f32(float value, float min_value, float max_value)
     return value;
 }
 
+static float abs_f32(float value)
+{
+    return (value < 0.0f) ? -value : value;
+}
+
+static int16_t round_f32_to_i16(float value)
+{
+    return (int16_t) ((value >= 0.0f) ? (value + 0.5f) : (value - 0.5f));
+}
+
 TIBallControlConfig TIBallControl_defaultConfig(void)
 {
     TIBallControlConfig config;
 
-    /* 安全起调值。实车先把 Ki 设为 0 调 Kp/Kd，再加入很小的 Ki。
-     *
-     * P 决定“偏得越远，水管倾得越多”；
-     * I 用来补偿水管无法完全调平造成的恒定漂移；
-     * D 根据小球运动速度反向刹车，避免冲过目标。
+    /* 轻微扰动结构的保守起调值，输出单位直接是SG90脉宽us。
+     * 正常状态使用：output = Kp*位置偏差 - Kd*小球坐标速度。
+     * 超限状态使用预测位置与期望速度，使回中过程先加速、接近中点再减速。
      */
-    config.kp_deg_per_cm = 1.8f;
-    config.ki_deg_per_cm_s = 0.08f;
-    config.kd_deg_per_cm_s = 0.65f;
-    config.integral_limit_cm_s = 20.0f;
-    config.max_tilt_deg = 10.0f;
-    config.deadband_cm = 0.15f;
+    config.kp_us_per_cm = 1.20f;
+    config.kd_us_per_cm_s = 0.35f;
+    config.return_kp_us_per_cm = 1.60f;
+    config.return_kv_us_per_cm_s = 0.45f;
+    config.return_speed_per_cm_s = 1.50f;
+    config.max_return_speed_cm_s = 12.0f;
+    config.prediction_time_s = 0.20f;
+    config.soft_limit_cm = 10.0f;
+    config.return_position_tolerance_cm = 0.40f;
+    config.return_velocity_tolerance_cm_s = 1.0f;
+    config.deadband_cm = 0.10f;
     config.position_alpha = 0.35f;
     config.velocity_alpha = 0.25f;
     config.pixels_per_cm = 20.0f;
+    config.pipe_middle_pixel = 960.0f;
+    config.max_pulse_offset_us = 20U;
     config.position_sign = 1;
     config.servo_sign = 1;
-    config.vision_timeout_ticks = 15U;
+    config.vision_timeout_ticks = 50U;
     return config;
 }
 
@@ -49,13 +64,17 @@ void TIBallControl_init(TIBallControl *control,
     control->position_cm = 0.0f;
     control->velocity_cm_s = 0.0f;
     control->target_cm = 0.0f;
-    control->integral = 0.0f;
     control->previous_position_cm = 0.0f;
+    control->physical_position_cm = 0.0f;
+    control->predicted_position_cm = 0.0f;
+    control->desired_velocity_cm_s = 0.0f;
     control->last_vision_tick = 0U;
     control->last_update_tick = 0U;
     control->task1_stable_start_tick = 0U;
     control->task1_phase = 0U;
-    control->output_tilt_deg_x10 = 0;
+    control->return_active = false;
+    control->return_settled = false;
+    control->output_pulse_offset_us = 0;
 }
 
 void TIBallControl_requestOriginCapture(TIBallControl *control)
@@ -65,9 +84,11 @@ void TIBallControl_requestOriginCapture(TIBallControl *control)
      */
     control->origin_valid = false;
     control->vision_valid = false;
-    control->integral = 0.0f;
     control->velocity_cm_s = 0.0f;
-    control->output_tilt_deg_x10 = 0;
+    control->return_active = false;
+    control->return_settled = false;
+    control->desired_velocity_cm_s = 0.0f;
+    control->output_pulse_offset_us = 0;
 }
 
 void TIBallControl_pushVision(TIBallControl *control,
@@ -119,6 +140,14 @@ void TIBallControl_pushVision(TIBallControl *control,
         control->previous_position_cm = control->position_cm;
     }
 
+    /* 物理中点坐标独立于KEY1任务原点，并沿用同一个位置低通结果：
+     * task position用于+5/-5等题目；physical position只用于安全超限回中。
+     */
+    control->physical_position_cm = control->position_cm +
+        (control->origin_pixel - control->config.pipe_middle_pixel) /
+        control->config.pixels_per_cm *
+        (float) control->config.position_sign;
+
     control->vision_valid = true;
     control->last_vision_tick = now_tick;
 }
@@ -137,12 +166,15 @@ bool TIBallControl_setTask(TIBallControl *control,
     }
 
     control->task = task;
-    control->integral = 0.0f;
     control->velocity_cm_s = 0.0f;
     control->previous_position_cm = control->position_cm;
     control->last_update_tick = now_tick;
     control->task1_phase = 0U;
     control->task1_stable_start_tick = 0U;
+    control->return_active = false;
+    control->return_settled = false;
+    control->desired_velocity_cm_s = 0.0f;
+    control->output_pulse_offset_us = 0;
 
     switch (task) {
     case TI_BALL_TASK_STATIC_PLUS5_TO_MINUS5:
@@ -178,7 +210,6 @@ static void update_task1(TIBallControl *control, uint32_t now_tick)
                    TI_TASK1_STABLE_TICKS) {
             control->task1_phase = 1U;
             control->target_cm = -TI_TASK1_TARGET_CM;
-            control->integral = 0.0f;
             control->task1_stable_start_tick = 0U;
         }
     } else if (abs_error > TI_TASK1_TOLERANCE_CM) {
@@ -190,10 +221,10 @@ void TIBallControl_update(TIBallControl *control,
                           uint32_t now_tick,
                           ServoControl *servo)
 {
-    uint32_t elapsed_ticks;
-    float dt_s;
     float error;
-    float tilt_deg;
+    float pulse_offset_us;
+    int16_t limited_offset_us;
+    int32_t target_pulse_us;
 
     if ((control->task == TI_BALL_TASK_IDLE) ||
         !control->origin_valid || !control->vision_valid ||
@@ -204,55 +235,91 @@ void TIBallControl_update(TIBallControl *control,
          *   2. KEY1后的原点还没捕获；
          *   3. 从未收到视觉坐标；
          *   4. K230坐标已经超时。
-         * 此时清积分并让水管回到机械水平脉宽。
+         * 此时不能继续沿用旧速度或旧输出，让水管回到机械水平脉宽。
          */
-        control->integral = 0.0f;
         control->velocity_cm_s = 0.0f;
-        control->output_tilt_deg_x10 = 0;
+        control->desired_velocity_cm_s = 0.0f;
+        control->output_pulse_offset_us = 0;
         ServoControl_center(servo);
         return;
     }
 
-    elapsed_ticks = now_tick - control->last_update_tick;
     control->last_update_tick = now_tick;
-    if (elapsed_ticks == 0U) elapsed_ticks = 1U;
-    if (elapsed_ticks > 5U) elapsed_ticks = 5U;
-    dt_s = (float) elapsed_ticks * TI_CONTROL_TICK_SECONDS;
 
-    if (control->task == TI_BALL_TASK_STATIC_PLUS5_TO_MINUS5) {
-        update_task1(control, now_tick);
+    /* 用当前速度预测prediction_time_s之后的位置。如果球正在快速向外运动，
+     * 即使当前位置尚未越界，预测位置也会先越界，从而提前触发回拉。
+     */
+    control->predicted_position_cm = control->physical_position_cm +
+        control->velocity_cm_s * control->config.prediction_time_s;
+
+    if (!control->return_active &&
+        ((abs_f32(control->physical_position_cm) >=
+          control->config.soft_limit_cm) ||
+         (abs_f32(control->predicted_position_cm) >=
+          control->config.soft_limit_cm))) {
+        /* 一旦超限便锁定回中，不在回中途中恢复原题目目标，避免再次加速冲出。
+         * 重新按题目按键/重新setTask才会解除这个安全状态。
+         */
+        control->return_active = true;
+        control->return_settled = false;
+        control->task1_stable_start_tick = 0U;
     }
 
-    /* 位置误差定义为“目标 - 实际”。
-     * 如果实物运动方向相反，优先改position_sign或servo_sign，不改此公式。
-     */
-    error = control->target_cm - control->position_cm;
-    if ((error > -control->config.deadband_cm) &&
-        (error < control->config.deadband_cm)) {
-        error = 0.0f;
+    if (control->return_active) {
+        float predicted_error = -control->predicted_position_cm;
+
+        /* 物理中点定义为0cm。期望速度与剩余距离耦合：
+         *   离中点远 -> 期望速度大，先加速；
+         *   接近中点 -> 期望速度自动变小，速度反馈促使水管提前刹车。
+         */
+        control->desired_velocity_cm_s = clamp_f32(
+            -control->config.return_speed_per_cm_s *
+                control->physical_position_cm,
+            -control->config.max_return_speed_cm_s,
+            control->config.max_return_speed_cm_s);
+
+        pulse_offset_us =
+            control->config.return_kp_us_per_cm * predicted_error +
+            control->config.return_kv_us_per_cm_s *
+                (control->desired_velocity_cm_s -
+                 control->velocity_cm_s);
+
+        /* 不能只用“经过中点”判断回中完成，还必须确认速度已经足够低。 */
+        control->return_settled =
+            (abs_f32(control->physical_position_cm) <=
+             control->config.return_position_tolerance_cm) &&
+            (abs_f32(control->velocity_cm_s) <=
+             control->config.return_velocity_tolerance_cm_s);
+    } else {
+        if (control->task == TI_BALL_TASK_STATIC_PLUS5_TO_MINUS5) {
+            update_task1(control, now_tick);
+        }
+
+        /* 正常状态使用纯位置—速度反馈，不使用积分：
+         *   output = Kp * (目标位置-实际位置) - Kd * 小球坐标速度。
+         * 因为velocity是d(position)/dt，所以这里必须是减号；如果使用的是
+         * d(error)/dt，数学上才写成加号。
+         */
+        error = control->target_cm - control->position_cm;
+        if (abs_f32(error) < control->config.deadband_cm) {
+            error = 0.0f;
+        }
+        control->desired_velocity_cm_s = 0.0f;
+        pulse_offset_us = control->config.kp_us_per_cm * error -
+            control->config.kd_us_per_cm_s * control->velocity_cm_s;
     }
 
-    /* I项按时间累加，并通过integral_limit_cm_s做抗饱和限幅。 */
-    control->integral += error * dt_s;
-    control->integral = clamp_f32(control->integral,
-                                  -control->config.integral_limit_cm_s,
-                                  control->config.integral_limit_cm_s);
+    /* 轻微扰动结构不再换算大角度，直接输出水平点附近的微小脉宽偏移。 */
+    pulse_offset_us = clamp_f32(
+        pulse_offset_us,
+        -(float) control->config.max_pulse_offset_us,
+        (float) control->config.max_pulse_offset_us);
+    pulse_offset_us *= (float) control->config.servo_sign;
+    limited_offset_us = round_f32_to_i16(pulse_offset_us);
+    control->output_pulse_offset_us = limited_offset_us;
 
-    /* 完整控制律：倾角 = Kp*误差 + Ki*积分 - Kd*小球速度。
-     * D项对测量速度作用，而不是对误差直接求导，因此题1从+5切换到-5时
-     * 不会因目标值突变产生很大的“微分冲击”。
-     */
-    tilt_deg = control->config.kp_deg_per_cm * error +
-               control->config.ki_deg_per_cm_s * control->integral -
-               control->config.kd_deg_per_cm_s * control->velocity_cm_s;
-    tilt_deg = clamp_f32(tilt_deg,
-                         -control->config.max_tilt_deg,
-                         control->config.max_tilt_deg);
-    tilt_deg *= (float) control->config.servo_sign;
-
-    control->output_tilt_deg_x10 = (int16_t) (tilt_deg * 10.0f);
-    /* PID只给“相对水平点的角度偏移”。真正的1900us中位、限幅、缓动和
-     * 定时器输出都由ServoControl负责。
-     */
-    ServoControl_setOffsetDegX10(servo, control->output_tilt_deg_x10);
+    target_pulse_us = (int32_t) servo->config.center_pulse_us +
+                      (int32_t) limited_offset_us;
+    if (target_pulse_us < 0L) target_pulse_us = 0L;
+    ServoControl_setPulseUs(servo, (uint16_t) target_pulse_us);
 }

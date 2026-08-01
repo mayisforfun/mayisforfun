@@ -94,9 +94,9 @@
  * 调试顺序建议：
  *   1. 先只让舵机保持中位，调 BALL_SERVO_CENTER_ANGLE_X10 或
  *      BALL_SERVO_CENTER_PULSE_US，让水管尽量水平。
- *   2. 再确认方向：如果 PID 输出为正时水管倾斜方向反了，
- *      不要先改 PID，先把 g_ball_servo_config.invert 改为 true。
- *   3. 最后再调 PID 的 Kp/Kd。
+ *   2. 再确认方向：如果正脉宽偏移使小球运动方向反了，修改
+ *      BALL_SERVO_SIGN，不要反着改位置—速度控制公式。
+ *   3. 最后再调 Kp/Kd 和超限回中的速度轨迹参数。
  *
  * 角度单位是“度 * 10”：
  *   600  = 60.0 度
@@ -111,10 +111,8 @@
  * BALL_SERVO_MAX_STEP_US 是每 10ms 控制周期允许变化的最大脉宽。
  * 它越大，舵机响应越快；它越小，水管动作越柔，但跟踪会更慢。
  *
- * 重要：当前实测水平点暂定为1900us，而上限仍是2000us，因此正方向只有
- * 100us行程，负方向却有900us行程。angle_to_pulse_us会按两侧剩余行程
- * 分别换算，所以相同的正负角度不一定得到相同的脉宽变化。这也是当前
- * 小球在某一侧时舵机动作不明显的重要排查点；这里只记录现状，不改参数。
+ * 当前水平点暂定为1900us。新状态反馈算法不再走大角度插值，而是在
+ * 1900us两侧直接限制为相同的微小脉宽偏移；1000/2000只保留为底层硬限幅。
  */
 #define BALL_SERVO_MIN_ANGLE_X10     600
 #define BALL_SERVO_CENTER_ANGLE_X10  900
@@ -122,7 +120,18 @@
 #define BALL_SERVO_MIN_PULSE_US      1000U
 #define BALL_SERVO_CENTER_PULSE_US   1900U
 #define BALL_SERVO_MAX_PULSE_US      2000U
-#define BALL_SERVO_MAX_STEP_US       20U
+#define BALL_SERVO_MAX_STEP_US       1U
+
+/* K230/水管几何标定参数。
+ * PIPE_MIDDLE_PIXEL必须是水管物理中点在1920宽图像里的center_x，不是
+ * KEY1按下时的小球初始位置。默认960只是画面中心，现场应以实测值替换。
+ */
+#define BALL_PIPE_MIDDLE_PIXEL       960.0f
+#define BALL_PIXELS_PER_CM           20.0f
+#define BALL_SOFT_LIMIT_CM           10.0f
+#define BALL_MAX_PULSE_OFFSET_US     20U
+#define BALL_POSITION_SIGN           1
+#define BALL_SERVO_SIGN              1
 
 volatile bool     g_ctrl_flag = false;
 volatile uint32_t g_sys_ticks = 0;
@@ -299,7 +308,13 @@ volatile bool     g_ball_origin_valid = false;
 volatile bool     g_ball_vision_valid = false;
 volatile float    g_ball_position_cm = 0.0f;
 volatile float    g_ball_target_cm = 0.0f;
-volatile int16_t  g_ball_tilt_deg_x10 = 0;
+volatile float    g_ball_velocity_cm_s = 0.0f;
+volatile float    g_ball_physical_position_cm = 0.0f;
+volatile float    g_ball_predicted_position_cm = 0.0f;
+volatile float    g_ball_desired_velocity_cm_s = 0.0f;
+volatile int16_t  g_ball_pulse_offset_us = 0;
+volatile bool     g_ball_return_active = false;
+volatile bool     g_ball_return_settled = false;
 volatile uint8_t  g_ball_task1_phase = 0U;
 
 /* 水管舵机的机械层配置。
@@ -614,7 +629,13 @@ static void update_ball_control_debug(const TIBallControl *control)
     g_ball_vision_valid = control->vision_valid;
     g_ball_position_cm = control->position_cm;
     g_ball_target_cm = control->target_cm;
-    g_ball_tilt_deg_x10 = control->output_tilt_deg_x10;
+    g_ball_velocity_cm_s = control->velocity_cm_s;
+    g_ball_physical_position_cm = control->physical_position_cm;
+    g_ball_predicted_position_cm = control->predicted_position_cm;
+    g_ball_desired_velocity_cm_s = control->desired_velocity_cm_s;
+    g_ball_pulse_offset_us = control->output_pulse_offset_us;
+    g_ball_return_active = control->return_active;
+    g_ball_return_settled = control->return_settled;
     g_ball_task1_phase = control->task1_phase;
 }
 
@@ -1422,6 +1443,15 @@ int main(void)
     UART1_enableRxInterrupt();
     ServoControl_init(&ball_servo, &g_ball_servo_config);
     ball_control_config = TIBallControl_defaultConfig();
+    /* 把最常现场标定的几何/方向参数集中在main.c顶部。其余状态反馈增益
+     * 在ti_ball_control.c的TIBallControl_defaultConfig()中调整。
+     */
+    ball_control_config.pipe_middle_pixel = BALL_PIPE_MIDDLE_PIXEL;
+    ball_control_config.pixels_per_cm = BALL_PIXELS_PER_CM;
+    ball_control_config.soft_limit_cm = BALL_SOFT_LIMIT_CM;
+    ball_control_config.max_pulse_offset_us = BALL_MAX_PULSE_OFFSET_US;
+    ball_control_config.position_sign = BALL_POSITION_SIGN;
+    ball_control_config.servo_sign = BALL_SERVO_SIGN;
     TIBallControl_init(&ball_control, &ball_control_config);
     update_ball_control_debug(&ball_control);
     g_ball_servo_angle_x10 = ServoControl_getCurrentAngleDegX10(&ball_servo);
