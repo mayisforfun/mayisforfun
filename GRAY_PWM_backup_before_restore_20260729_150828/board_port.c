@@ -82,9 +82,16 @@ static void set_pwm_duty(GPTIMER_Regs *timer, DL_TIMER_CC_INDEX cc_index, uint16
  * 如果 SysConfig 生成的是反相 PWM，就把 SERVO_PWM_COMPARE_IS_INVERTED
  * 置 1，这样 compare 会自动用 period - ticks。
  */
-static void set_servo_pulse_us(uint16_t pulse_us)
+static void set_water_pipe_servo_pulse_us(uint16_t pulse_us)
 {
 #if SERVO_PWM_ENABLE
+    /* 这个PWM只控制水管SG90；小车电机PWM仍由TIMG0独立输出。 */
+    if (pulse_us < SERVO_PWM_SAFE_MIN_PULSE_US) {
+        pulse_us = SERVO_PWM_SAFE_MIN_PULSE_US;
+    } else if (pulse_us > SERVO_PWM_SAFE_MAX_PULSE_US) {
+        pulse_us = SERVO_PWM_SAFE_MAX_PULSE_US;
+    }
+
     /* us 转定时器计数值。加 500000 是为了做四舍五入，避免低频时误差偏大。 */
     uint32_t ticks = ((uint32_t) pulse_us * SERVO_PWM_TIMER_CLK_HZ +
                       500000U) / 1000000U;
@@ -100,9 +107,15 @@ static void set_servo_pulse_us(uint16_t pulse_us)
     compare_value = ticks;
 #endif
 
-    DL_TimerG_setCaptureCompareValue(SERVO_PWM_INST,
+    DL_TimerA_setCaptureCompareValue(SERVO_PWM_INST,
                                      (uint16_t) compare_value,
                                      SERVO_PWM_CC_INDEX);
+    /* IO表里PB0/C0和PB1/C1都标为舵机输出，所以两个通道写入相同脉宽。
+     * 舵机信号线接其中任意一个接口，得到的控制波形都相同。
+     */
+    DL_TimerA_setCaptureCompareValue(SERVO_PWM_INST,
+                                     (uint16_t) compare_value,
+                                     SERVO_PWM_ALT_CC_INDEX);
 #else
     /* 还没有配置舵机 PWM 硬件时，保留空实现，方便先编译和写上层算法。 */
     (void) pulse_us;
@@ -167,7 +180,7 @@ void Board_init(void)
 
     Board_setServoPulseUs(SERVO_PWM_CENTER_PULSE_US);
 #if SERVO_PWM_ENABLE
-    DL_TimerG_startCounter(SERVO_PWM_INST);
+    DL_TimerA_startCounter(SERVO_PWM_INST);
 #endif
 
     /* 100 Hz control loop: one control update every 10 ms. */
@@ -284,7 +297,7 @@ void Board_setServoPulseUs(uint16_t pulse_us)
      * 上层 servo_control.c 只关心“我要输出多少 us”，不直接碰定时器寄存器。
      * 这样以后换舵机引脚或定时器，只需要改 board_port 这一层。
      */
-    set_servo_pulse_us(pulse_us);
+    set_water_pipe_servo_pulse_us(pulse_us);
 }
 
 /* Any configured key can start/stop the car. Keys are treated as active low. */

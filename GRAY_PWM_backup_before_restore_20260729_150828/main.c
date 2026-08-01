@@ -10,6 +10,7 @@
 #include "mpu6050.h"
 #include "oled_debug.h"
 #include "servo_control.h"
+#include "ti_ball_control/ti_ball_control.h"
 
 /* 速度闭环开关和单轮速度 PID 参数。
  * Q10 表示真实增益 = 参数值 / 1024。速度环只做温和修正：
@@ -109,12 +110,17 @@
  *
  * BALL_SERVO_MAX_STEP_US 是每 10ms 控制周期允许变化的最大脉宽。
  * 它越大，舵机响应越快；它越小，水管动作越柔，但跟踪会更慢。
+ *
+ * 重要：当前实测水平点暂定为1900us，而上限仍是2000us，因此正方向只有
+ * 100us行程，负方向却有900us行程。angle_to_pulse_us会按两侧剩余行程
+ * 分别换算，所以相同的正负角度不一定得到相同的脉宽变化。这也是当前
+ * 小球在某一侧时舵机动作不明显的重要排查点；这里只记录现状，不改参数。
  */
 #define BALL_SERVO_MIN_ANGLE_X10     600
 #define BALL_SERVO_CENTER_ANGLE_X10  900
 #define BALL_SERVO_MAX_ANGLE_X10     1200
 #define BALL_SERVO_MIN_PULSE_US      1000U
-#define BALL_SERVO_CENTER_PULSE_US   1500U
+#define BALL_SERVO_CENTER_PULSE_US   1900U
 #define BALL_SERVO_MAX_PULSE_US      2000U
 #define BALL_SERVO_MAX_STEP_US       20U
 
@@ -288,7 +294,18 @@ volatile bool     g_h_task2_slow_mode = false;
 volatile uint8_t  g_h_task2_slow_ticks = 0;
 volatile int16_t  g_ball_servo_angle_x10 = BALL_SERVO_CENTER_ANGLE_X10;
 volatile uint16_t g_ball_servo_pulse_us = BALL_SERVO_CENTER_PULSE_US;
+volatile uint8_t  g_ball_task = TI_BALL_TASK_IDLE;
+volatile bool     g_ball_origin_valid = false;
+volatile bool     g_ball_vision_valid = false;
+volatile float    g_ball_position_cm = 0.0f;
+volatile float    g_ball_target_cm = 0.0f;
+volatile int16_t  g_ball_tilt_deg_x10 = 0;
+volatile uint8_t  g_ball_task1_phase = 0U;
 
+/* 水管舵机的机械层配置。
+ * PID不直接使用这些脉宽；它输出相对中心角的倾角，再由servo_control.c
+ * 依据这里的min/center/max换算为实际PWM。
+ */
 static const ServoControlConfig g_ball_servo_config = {
     .min_angle_x10    = BALL_SERVO_MIN_ANGLE_X10,
     .center_angle_x10 = BALL_SERVO_CENTER_ANGLE_X10,
@@ -566,6 +583,39 @@ static void update_k230_debug(void)
     g_k230_raw5 = g_k230_raw_last8[5];
     g_k230_raw6 = g_k230_raw_last8[6];
     g_k230_raw7 = g_k230_raw_last8[7];
+}
+
+/* Copy one coherent center_x sample from data owned by the UART ISR. */
+static bool take_new_ball_center_x(uint32_t *last_frame_count,
+                                   uint16_t *center_x)
+{
+    uint32_t primask = __get_PRIMASK();
+    uint32_t frame_count;
+    bool is_new;
+
+    __disable_irq();
+    frame_count = g_k230_frame_count;
+    is_new = frame_count != *last_frame_count;
+    if (is_new) {
+        *center_x = g_k230_center_x;
+        *last_frame_count = frame_count;
+    }
+    if (primask == 0U) {
+        __enable_irq();
+    }
+
+    return is_new;
+}
+
+static void update_ball_control_debug(const TIBallControl *control)
+{
+    g_ball_task = (uint8_t) control->task;
+    g_ball_origin_valid = control->origin_valid;
+    g_ball_vision_valid = control->vision_valid;
+    g_ball_position_cm = control->position_cm;
+    g_ball_target_cm = control->target_cm;
+    g_ball_tilt_deg_x10 = control->output_tilt_deg_x10;
+    g_ball_task1_phase = control->task1_phase;
 }
 
 static void set_motor_debug(int16_t left, int16_t right)
@@ -1349,6 +1399,9 @@ int main(void)
     RunIndicator run_indicator;
     BluetoothUART bt_uart;
     ServoControl ball_servo;
+    TIBallControl ball_control;
+    TIBallControlConfig ball_control_config;
+    uint32_t ball_last_frame_count = 0U;
 #if TASK2024_ENABLE
     Task2024State task2024;
 #endif
@@ -1368,6 +1421,9 @@ int main(void)
     BluetoothUART_init(&bt_uart);
     UART1_enableRxInterrupt();
     ServoControl_init(&ball_servo, &g_ball_servo_config);
+    ball_control_config = TIBallControl_defaultConfig();
+    TIBallControl_init(&ball_control, &ball_control_config);
+    update_ball_control_debug(&ball_control);
     g_ball_servo_angle_x10 = ServoControl_getCurrentAngleDegX10(&ball_servo);
     g_ball_servo_pulse_us = ServoControl_getCurrentPulseUs(&ball_servo);
 #if TASK2024_ENABLE
@@ -1388,8 +1444,21 @@ int main(void)
         g_ctrl_flag = false;
 
         BluetoothUART_poll(&bt_uart);
-        UART1_poll();
+        /* K230串口接收由中断完成，主循环不能再轮询同一个RX FIFO。
+         * 否则中断和主循环会同时修改协议解析状态，造成偶发丢帧或错帧。
+         */
         update_k230_debug();
+        {
+            uint16_t center_x;
+
+            /* 每个K230帧只处理一次。take_new_ball_center_x会用frame_count
+             * 判断是否为新帧，并在短临界区内取得一致的center_x快照。
+             */
+            if (take_new_ball_center_x(&ball_last_frame_count, &center_x)) {
+                TIBallControl_pushVision(
+                    &ball_control, center_x, g_sys_ticks);
+            }
+        }
 #if TASK2024_ENABLE
         if (task2024.active || g_h_task2_active) {
             imu_update_heading();
@@ -1406,11 +1475,15 @@ int main(void)
             update_bluetooth_debug(&bt_uart, bt_line, BluetoothUART_getCommand(&bt_uart), false);
         }
 
-        /* 舵机控制先独立刷新。
-         * 现在目标默认保持中位；后面接视觉 PID 时，只需要在这里之前
-         * 根据小球位置调用 ServoControl_setOffsetDegX10()。
+        /* 舵机闭环每10ms执行一次，且放在小车g_run_enabled判断之前：
+         *   1. TIBallControl_update：由小球位置算目标水管倾角；
+         *   2. ServoControl_update：将目标倾角换算并缓动到实际PWM；
+         *   3. 同步调试变量，方便CCS Expressions逐层定位。
+         * 因此题1即使让小车保持停止，水管舵机仍会持续控制。
          */
+        TIBallControl_update(&ball_control, g_sys_ticks, &ball_servo);
         ServoControl_update(&ball_servo);
+        update_ball_control_debug(&ball_control);
         g_ball_servo_angle_x10 = ServoControl_getCurrentAngleDegX10(&ball_servo);
         g_ball_servo_pulse_us = ServoControl_getCurrentPulseUs(&ball_servo);
 
@@ -1420,15 +1493,40 @@ int main(void)
                 reset_control_state(&line_state, &track_fsm, &cross_detector,
                                     &left_speed_pid, &right_speed_pid,
                                     &current_base_speed);
-                if (key_id == 2U) {
+                if (key_id == 1U) {
+                    /* KEY1启动小球题1：
+                     *   - 小车电机保持停止；
+                     *   - 丢弃按键前的旧视觉原点；
+                     *   - KEY1后的第一帧center_x定义为0cm；
+                     *   - 目标先设为+5cm，稳定1秒后自动切到-5cm。
+                     */
+                    g_run_enabled = false;
+                    g_h_task2_active = false;
+                    Task2024_reset(&task2024);
+                    TIBallControl_requestOriginCapture(&ball_control);
+                    (void) TIBallControl_setTask(
+                        &ball_control,
+                        TI_BALL_TASK_STATIC_PLUS5_TO_MINUS5,
+                        g_sys_ticks);
+                    RunIndicator_onStop(&run_indicator);
+                } else if (key_id == 2U) {
+                    (void) TIBallControl_setTask(
+                        &ball_control, TI_BALL_TASK_IDLE, g_sys_ticks);
+                    ServoControl_center(&ball_servo);
                     Task2024_reset(&task2024);
                     h_task2_start();
+                    g_run_enabled = true;
+                    RunIndicator_onStart(&run_indicator);
                 } else {
+                    (void) TIBallControl_setTask(
+                        &ball_control, TI_BALL_TASK_IDLE, g_sys_ticks);
+                    ServoControl_center(&ball_servo);
                     g_h_task2_active = false;
                     Task2024_start(&task2024, key_id);
+                    g_run_enabled = true;
+                    RunIndicator_onStart(&run_indicator);
                 }
-                g_run_enabled = true;
-                RunIndicator_onStart(&run_indicator);
+                update_ball_control_debug(&ball_control);
                 break;
             }
         }

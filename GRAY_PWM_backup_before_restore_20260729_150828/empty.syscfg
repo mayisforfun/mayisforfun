@@ -25,6 +25,7 @@ const I2C    = scripting.addModule("/ti/driverlib/I2C", {}, false);
 const I2C1   = I2C.addInstance();
 const PWM    = scripting.addModule("/ti/driverlib/PWM", {}, false);
 const PWM1   = PWM.addInstance();
+const PWM2   = PWM.addInstance();
 const SYSCTL = scripting.addModule("/ti/driverlib/SYSCTL");
 const UART   = scripting.addModule("/ti/driverlib/UART", {}, false);
 const UART1  = UART.addInstance();
@@ -140,6 +141,24 @@ PWM1.PWM_CHANNEL_1.dutyCycle    = 50;
 PWM1.PWM_CHANNEL_1.ccValue      = 1000;
 PWM1.ccp0PinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric0";
 PWM1.ccp1PinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric1";
+
+/* Water-pipe SG90: PB1 / TIMA1_C1, independent from the TIMG0 motor PWM. */
+PWM2.$name                      = "SERVO_PWM";
+PWM2.ccIndex                    = [0,1];
+PWM2.clockPrescale              = 80;
+PWM2.timerCount                 = 20000;
+PWM2.peripheral.$assign         = "TIMA1";
+PWM2.peripheral.ccp0Pin.$assign = "PB0";
+PWM2.peripheral.ccp1Pin.$assign = "PB1";
+PWM2.PWM_CHANNEL_0.$name        = "water_pipe_servo_alt_channel";
+PWM2.PWM_CHANNEL_0.dutyCycle    = 7.5;
+PWM2.PWM_CHANNEL_0.ccValue      = 18500;
+PWM2.PWM_CHANNEL_1.$name        = "water_pipe_servo_channel";
+PWM2.PWM_CHANNEL_1.dutyCycle    = 7.5;
+/* EDGE_ALIGN with initial LOW uses compare = period - high_time. */
+PWM2.PWM_CHANNEL_1.ccValue      = 18500;
+PWM2.ccp0PinConfig.$name        = "water_pipe_servo_alt_pin";
+PWM2.ccp1PinConfig.$name        = "water_pipe_servo_pin";
 
 SYSCTL.forceDefaultClkConfig = true;
 SYSCTL.clockTreeEn           = true;
